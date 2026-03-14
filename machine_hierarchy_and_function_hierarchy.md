@@ -18,9 +18,14 @@ The **Linqu system** is defined as a conceptual **hierarchical machine** : a hi
 | **4** | **Cluster-level-0**    | First cluster tier; usually within a **single server or pod**; high bandwidth, tight coupling.                                                                                                                                                                                                                                 |
 | **5** | **Cluster-level-1**    | Second cluster tier; usually within a **supernode**; high-bandwidth domain across nodes.                                                                                                                                                                                                                                       |
 | **6** | **Cluster-level-2**    | Third cluster tier; typically connected with **contracted bandwidth**; wider-area or cross-rack.                                                                                                                                                                                                                               |
+| **7** | **Global Coordinator** | Top of hierarchy; coordinates all cluster-level-2 instances. Entry point for a global program.                                                                                                                                                                                 |
 
 
 ```
+                    ┌─────────────────────────────────────────────────────────┐
+  Level 7            │  Global Coordinator (top-level entry point)               │
+                    └─────────────────────────────────────────────────────────┘
+                                         │ encloses several
                     ┌─────────────────────────────────────────────────────────┐
   Level 6            │  Cluster-level-2 (e.g. cross-rack, contracted bandwidth) │
                     └─────────────────────────────────────────────────────────┘
@@ -236,6 +241,7 @@ Introduce a first-class notion of **hierarchy level** that aligns with the Linqu
 | `pl.Level.CLUSTER_0`  | 4              | Cluster-level-0 (e.g. server / pod)                      | `pl.Level.POD`                       |
 | `pl.Level.CLUSTER_1`  | 5              | Cluster-level-1 (e.g. supernode)                         | `pl.Level.CLOS1`                     |
 | `pl.Level.CLUSTER_2`  | 6              | Cluster-level-2 (e.g. cross-rack)                        | `pl.Level.CLOS2`                     |
+| `pl.Level.GLOBAL`     | 7              | Global coordinator (top of hierarchy)                     | —                                    |
 
 
 **Aliases (same value as primary, for readability):** `pl.Level.L2CACHE` = `pl.Level.CHIP_DIE`; `pl.Level.PROCESSOR` = `pl.Level.UMA` = `pl.Level.CHIP`; `pl.Level.NODE` = `pl.Level.HOST`; `pl.Level.POD` = `pl.Level.CLUSTER_0`; `pl.Level.CLOS1` = `pl.Level.CLUSTER_1`; `pl.Level.CLOS2` = `pl.Level.CLUSTER_2`. Programs may use either the primary name or the alias.
@@ -322,6 +328,61 @@ with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.fully_unroll_static_loop):
 
 The **same** `pl.Level.*` is used for all hierarchy levels; implicit declaration is **unified** under `**pl.at(level=..., optimization=...)`** (replacing separate `pl.incore` / `pl.auto_incore` / `pl.auto`).
 
+### 5.7 Function role: `role=pl.Role.{ORCHESTRATOR, WORKER}`
+
+For L3–L7 CPU-side runtimes, the runtime distinguishes between two function roles within each hierarchy level:
+
+| Role | Meaning |
+|------|---------|
+| `pl.Role.ORCHESTRATOR` | Builds DAG / task graph, submits child tasks (same-level workers or next-level orchestrators), manages tensor/task ring allocation. Never performs compute directly. |
+| `pl.Role.WORKER` | Executes concrete compute or data tasks. Takes tensor inputs/outputs managed by the DAG scheduler. Never submits further tasks. |
+
+Both explicit and implicit grammar forms accept the `role` parameter:
+
+```python
+# Explicit — decorator style
+@pl.function(level=pl.Level.HOST, role=pl.Role.WORKER)
+def dfs_reader(path: str, out: pl.Tensor):
+    ...
+
+@pl.function(level=pl.Level.POD, role=pl.Role.ORCHESTRATOR)
+def pod_orchestrator(inputs: list[pl.Tensor]) -> pl.Tensor:
+    ...
+
+# Implicit — block style
+with pl.at(level=pl.Level.HOST, role=pl.Role.WORKER):
+    # block is outlined as a worker function at HOST level
+    ...
+
+with pl.at(level=pl.Level.POD, role=pl.Role.ORCHESTRATOR):
+    # block is outlined as an orchestrator function at POD level
+    ...
+```
+
+**Default behavior:** if `role` is omitted, the runtime treats the function as `ORCHESTRATOR` for backward compatibility with existing compiler outputs.
+
+**Runtime semantics:**
+- Workers are dispatched by the scheduler when all tensor-typed input dependencies are satisfied (`PENDING → READY`). Scalar arguments (coordinates, loop indices, file paths) are not tracked in the DAG.
+- Orchestrators run on the orchestrator thread, build the DAG by calling `submit_worker()` and `submit_orchestrator()`, and may invoke `pl.tree_reduce()` to construct reduction DAGs.
+- At each hierarchy level, the runtime maintains: 1 orchestrator thread, N scheduler threads, M worker threads — all in the same process sharing ring structures.
+
+### 5.8 Built-in DAG patterns: `pl.tree_reduce`
+
+The `pl.tree_reduce` utility constructs a binary tree reduction DAG from a list of leaf tensors:
+
+```python
+result = pl.tree_reduce(
+    runtime,        # LevelRuntime instance
+    leaves,         # list[pl.Tensor] — leaf tensors to reduce
+    pair_fn,        # callable(a: pl.Tensor, b: pl.Tensor, out: pl.Tensor)
+    name="reduce"   # task name for tracing
+)
+```
+
+**Semantics:** submits all `(N−1)` internal-node workers upfront in a single sequential pass (no waiting between rounds). The tensor-map DAG automatically dispatches each internal-node worker when both of its inputs become ready. The orchestrator waits only once, on the root future.
+
+This matches the tree reduction pattern described in `linqu_runtime_design.md` §7.3A-2a.
+
 ---
 
 ## 6. Summary Table: Scope Construct → Hierarchy Level
@@ -332,19 +393,34 @@ The **same** `pl.Level.*` is used for all hierarchy levels; implicit declaration
 | `pl.scope()`                                                      | Orchestration                | Host (3)                              | Runtime / frontend (scope depth, ring layer)                                  |
 | `pl.free(tensor)`                                                 | Orchestration                | Host (3)                              | Frontend → `pto_rt.free(outbuf)`                                              |
 | Cluster-outlined function                                         | Cluster                      | Cluster-level-0 (4) or chip/die (1–2) | OutlineClusterScopes                                                          |
-| `pl.at(level=pl.Level.*)`                                         | any                          | Level (0–6)                           | One outlined function at given level                                          |
-| `pl.at(level=pl.Level.*, optimization=pl.chunked_loop_optimizer)` | any                          | Level (0–6)                           | SplitChunkedLoops → … → Outline*Scopes (per level); replaces `pl.auto_incore` |
-| `@pl.function(type=InCore)` / `@pl.function(level=pl.Level.*)`    | InCore / any                 | Level (0–6)                           | Outline*Scopes (per level)                                                    |
+| `pl.at(level=pl.Level.*)`                                         | any                          | Level (0–7)                           | One outlined function at given level                                          |
+| `pl.at(level=pl.Level.*, optimization=pl.chunked_loop_optimizer)` | any                          | Level (0–7)                           | SplitChunkedLoops → … → Outline*Scopes (per level); replaces `pl.auto_incore` |
+| `pl.at(level=pl.Level.*, role=pl.Role.*)`                         | any                          | Level (3–7)                           | Outlined function with explicit orchestrator/worker role                      |
+| `@pl.function(type=InCore)` / `@pl.function(level=pl.Level.*)`    | InCore / any                 | Level (0–7)                           | Outline*Scopes (per level)                                                    |
+| `@pl.function(level=pl.Level.*, role=pl.Role.*)`                   | any                          | Level (3–7)                           | Explicit role-annotated function at given level                               |
+| `pl.tree_reduce(rt, leaves, pair_fn)`                              | DAG pattern                  | Level (3–7)                           | Binary tree reduction DAG built by orchestrator                               |
 | InCoreFunctionGroup                                               | Function group on core-group | Core-group (0)                        | ExpandMixedKernel                                                             |
 | AIC / AIV kernel                                                  | InCore kernel on one core    | Core (0)                              | ExpandMixedKernel (splitting + TPUSH/TPOP)                                    |
 
 
 ---
 
-## 7. References
+## 7. Example Programs
 
-- **Multi-level runtime and `pl.free`:** `multi_level_runtime_ring_and_pypto_free_api.md`  
-- **ExpandMixedKernel and InCoreFunctionGroup:** `HL_new_feature_Expand_Mixed_Kernel_and_call_spmd.md`  
-- **TPUSH/TPOP (intra-cluster):** `HL_ptoisa_newfeature20260306_TPUSH_TPOP.md`  
+Two complete example programs demonstrate the DFS hierarchical sum algorithm using both grammar styles. Both express the same computation as `test_dfs_sum_hierarchy.cpp`:
+
+- **`test_dfs_sum_hierarchy_pl_function.py`** — uses `@pl.function(level=..., role=...)` decorator style. Each orchestrator and worker is a named, decorated function.
+- **`test_dfs_sum_hierarchy_pl_at.py`** — uses `with pl.at(level=..., role=...)` block style. Orchestrator and worker logic is defined inline within scoped blocks.
+
+Both files are in `pypto_runtime_distributed/tests/unit/`.
+
+---
+
+## 8. References
+
+- **Multi-level runtime and `pl.free`:** `multi_level_runtime_ring_and_pypto_free_api.md`
+- **ExpandMixedKernel and InCoreFunctionGroup:** `HL_new_feature_Expand_Mixed_Kernel_and_call_spmd.md`
+- **TPUSH/TPOP (intra-cluster):** `HL_ptoisa_newfeature20260306_TPUSH_TPOP.md`
 - **Tensor shape and views:** `tensor_valid_shape.md`
+- **Linqu runtime design:** `linqu_runtime_design.md`
 
