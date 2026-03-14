@@ -90,7 +90,7 @@ The existing runtime, implemented in the **`pypto_workspace/simpler`** repositor
 
 This project's scope is to build a **coherent runtime that covers Levels 2 through 6** (Chip through Cluster-level-2) in one unified design:
 
-- **Level 2** (Chip): the interface layer — this project **wraps** the `simpler` runtime, treating it as the Level 0–2 execution engine. The `simpler` API for submitting orchestration functions to a chip becomes the "chip-level backend" that this project calls.
+- **Level 2** (Chip): the interface layer — a future `ChipBackend` adapter (within this project) will call `simpler`'s existing API through a stable ABI (dynamic linking, no compile-time dependency) to dispatch chip-level work. In Phase 0, L2 dispatch is stubbed. The adapter does **not** modify `simpler`.
 - **Level 3** (Host): multi-chip coordination within a single OS instance. This is the first new capability.
 - **Levels 4–6** (Cluster-level-0/1/2): multi-host coordination across pods, supernodes, and racks. These are built as extensions of Level 3.
 
@@ -103,7 +103,7 @@ The architecture is:
 │  Level 5: Cluster-level-1 (supernode)                               │
 │  Level 4: Cluster-level-0 (pod)                                     │
 │  Level 3: Host (multi-chip coordination)                            │
-│  Level 2: Chip (adaptation layer — wraps simpler)                   │
+│  Level 2: Chip (adaptation layer — future ChipBackend adapter)      │
 ├─────────────────────────────────────────────────────────────────────┤
 │  simpler runtime (Levels 0–2, DO NOT MODIFY)                        │
 │  Level 2: Chip orchestration (task ring, buffer ring, scope mgmt)   │
@@ -116,15 +116,17 @@ The architecture is:
 
 The Linqu runtime **adapts to** the `simpler` runtime at the Level 2 boundary:
 
-1. **Calling convention:** When the Linqu runtime needs to execute a chip-level (Level 2) function, it calls into `simpler`'s existing orchestration submission API. The Linqu runtime does **not** re-implement task rings, buffer rings, or scope-exit logic for Level 0–2 — it delegates to `simpler`.
+1. **Calling convention:** When the Linqu runtime needs to execute a chip-level (Level 2) function, a future `ChipBackend` adapter will call `simpler`'s existing orchestration API through dynamic linking (`dlopen`/`dlsym`). The Linqu runtime does **not** re-implement task rings, buffer rings, or scope-exit logic for Level 0–2 — those remain `simpler`'s responsibility. In Phase 0, this dispatch is stubbed. The `ChipBackend` adapter lives within `pypto_runtime_distributed` and does **not** modify `simpler`.
 
-2. **Identity mapping:** `simpler` uses its own task identity scheme internally (e.g. `task_id` within a chip). The Linqu runtime wraps this with the full `TaskKey(logical_system, L6..L0, scope_depth, task_id)` coordinate. The `simpler`-internal `task_id` becomes the `L0/L2` portion of the full key.
+2. **Identity mapping:** `simpler` uses its own task identity scheme internally (e.g. `task_id` within a chip). The Linqu runtime maps this to the full `TaskKey(logical_system, L6..L0, scope_depth, task_id)` coordinate. The `simpler`-internal `task_id` becomes the `L0/L2` portion of the full key.
 
 3. **Ring buffer layering:** For Levels 0–2, `simpler` manages its own ring buffers. For Levels 3–6, the Linqu runtime manages **its own** ring buffers (`task_ring[L][d]`, `buffer_ring[L][d]` for `L ≥ 3`). The two ring systems are independent; the Linqu runtime does not modify `simpler`'s rings.
 
 4. **Scope nesting:** `simpler` manages scope depth within a chip. The Linqu runtime manages **higher-level scopes** (e.g. a host-level scope that contains multiple chip-level scopes). When the Linqu runtime exits a Level 3 scope, it performs Level 3 ring retirement; the chip-level scope exits inside `simpler` are handled by `simpler` independently.
 
-5. **Future Level 1 support:** When `simpler` adds Level 1 (chip-die) support, it will be transparent to the Linqu runtime. The Linqu runtime only interacts with `simpler` at the Level 2 boundary.
+5. **Memory domain boundary (h2d/d2h):** The L3 runtime (host CPU) and L2 runtime (`simpler` on device) operate in **different memory domains** — host DRAM vs. device Global Memory. Data crosses this boundary via explicit `h2d_copy` (host→device) and `d2h_copy` (device→host) DMA operations. The L3 `ChipBackend` adapter is responsible for managing these transfers. Tensor handles in the Linqu runtime (opaque integers) are mapped to actual device GM addresses by the adapter during `h2d_copy`. See §7.4 (Tier 2) for the detailed communication model.
+
+6. **Future Level 1 support:** When `simpler` adds Level 1 (chip-die) support, it will be transparent to the Linqu runtime. The Linqu runtime only interacts with `simpler` at the Level 2 boundary.
 
 ### 3.4 Hardware Verification Environment Limitation
 
@@ -362,6 +364,28 @@ with pl.at(level=pl.Level.CLUSTER_0):
 - `with pl.incore` → `with pl.at(level=pl.Level.CORE_GROUP)`
 - `with pl.auto_incore` → `with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer)`
 
+### 6.4 Function Role Extension: `role={orchestrator|worker}`
+
+To support explicit role separation in L3-L7 software runtimes, both explicit and implicit grammar forms are extended with a role argument:
+
+```python
+@pl.function(level=pl.Level.HOST, role=pl.Role.ORCHESTRATOR)
+def host_orchestrator(...): ...
+
+@pl.function(level=pl.Level.HOST, role=pl.Role.WORKER)
+def host_worker(...): ...
+
+with pl.at(level=pl.Level.POD, role=pl.Role.ORCHESTRATOR):
+    ...
+```
+
+Role semantics:
+- `ORCHESTRATOR`: builds DAG/task graph, submits child tasks (same-level workers or next-level orchestrators), manages tensor/task ring allocation.
+- `WORKER`: executes concrete compute/data tasks; may invoke lower-level orchestrator dispatch via RPC.
+
+Default behavior:
+- If role is omitted, runtime treats the function as `ORCHESTRATOR` for backward compatibility with existing compiler outputs.
+
 ---
 
 ## 7. Distributed Runtime Architecture (Levels 3–6)
@@ -415,16 +439,262 @@ Every host runs a lightweight **Node Daemon** that:
 6. On `CALL_TASK` receipt: looks up the blob hash in CodeCache, looks up data handles in DataCache, executes the function with the given `spmd_idx`.
 7. On `SCOPE_EXIT` receipt at depth `d`: retires all tasks and buffers at that scope depth, advancing `last_task_alive[L][d]` and freeing ring slots.
 
-### 7.4 Communication Model by Level
+### 7.3A L3-L7 Thread Model and Role Separation (Enhancement)
 
-| Level boundary | Transport mechanism | Serialization |
-|----------------|---------------------|---------------|
-| Level 0 (intra-core-group) | TPUSH/TPOP hardware DMA | None (on-chip) |
-| Level 0–2 (intra-chip) | Shared memory / on-chip interconnect | None (pointer passing via buffer_ring) |
-| Level 2–3 (chip → host) | PCIe / NVLink DMA | Minimal header |
-| Level 3–4 (intra-pod) | RDMA or high-speed TCP | Binary RPC (FlatBuffers) |
-| Level 4–5 (intra-supernode) | TCP / RDMA fabric | Binary RPC |
-| Level 5–6 (cross-rack) | TCP with possible compression | Binary RPC |
+For L3-L7 CPU runtime instances, initialization uses a three-role thread model:
+
+1. **Orchestrator thread (1 thread):**
+   - Builds DAG graph of submitted tasks.
+   - Allocates task/tensor ring entries.
+   - Submits tasks to same-level workers or to next-level orchestrators.
+
+2. **Scheduler threads (`Lx_NUM_SCHEDULER_THREADS`, default = 1):**
+   - Track task state transitions.
+   - Resolve DAG dependencies.
+   - Dispatch ready tasks to worker queues.
+
+3. **Worker threads (`Lx_NUM_WORKER_THREADS`, test default = 4):**
+   - Execute worker functions on CPU.
+   - For orchestrator-targeted child work, send RPC dispatch to lower-level runtime.
+
+This is intentionally aligned with the simpler L0-L2 control model (orchestrator/scheduler/ring/worker), with one key difference:
+- **L3-L7 workers run on CPU threads** in host processes.
+- **L0-L2 workers run on AIC/AIV cores** through the simpler runtime.
+
+#### 7.3A-1 Tensor Output Buffer Allocation at Task-Submit Time
+
+`make_tensor(n)` / `create_tensor(n)` creates a Tensor descriptor with **metadata only**:
+handle, element count, and a readiness flag.  **No backing storage is allocated** by
+`make_tensor`.  The underlying buffer is a zero-size placeholder at this stage.
+
+Storage is allocated from the level's **memory ring** (HeapRing equivalent) inside
+`submit_worker()`, as the very first step before the task is enqueued:
+
+```
+make_tensor(n)        →  Tensor{handle, count, data=∅, ready=false}   (no alloc)
+submit_worker(…, out) →  out.data = memory_ring.alloc(n)              (alloc here)
+                         enqueue task in task ring
+worker executes       →  writes into out.data[0..n-1]
+                         marks out.ready = true
+```
+
+This matches the simpler (L0-L2) runtime's protocol where `alloc_tensor` claims a
+HeapRing slot and records its GM address in the Tensor descriptor, and the worker
+writes the result directly into that pre-allocated slot.
+
+**Rationale:** Deferring allocation to submit time avoids reserving ring space for tasks
+that have not yet been committed to the DAG, and keeps the memory ring a simple
+monotonic allocator with deterministic back-pressure.
+
+#### 7.3A-2 Task Dependency DAG Tracks Tensor Parameters Only
+
+The scheduler resolves dependencies by inspecting `TaskDesc::input_handles`, which
+lists **only tensor-typed parameters** of the task function.  Scalars, integers,
+strings, file paths, and other non-tensor arguments are **not tracked** in the DAG.
+
+```
+submit_worker(fn, inputs=[Tensor A, Tensor B], outputs=[Tensor C])
+    → TaskDesc.input_handles  = {A.handle, B.handle}   ← DAG edges
+    → TaskDesc.output_handles = {C.handle}
+```
+
+Non-tensor arguments (hierarchy coordinates, loop indices, file paths, etc.) are passed
+to the worker via lambda captures or struct fields and are **invisible to the scheduler**.
+The scheduler promotes a task from PENDING → READY solely when every handle in
+`input_handles` has `is_ready() == true`.  No scalar conditions are evaluated.
+
+This is consistent with the simpler runtime, where `Tensor` parameters carry buffer
+addresses and dependency lists, while scalar arguments (SPMD index, configuration
+values) are passed as plain integers in the task payload.
+
+#### 7.3A-2a Tree Reduction Pattern: Parallel Worker Submission via Tensor-Map DAG
+
+A canonical orchestration pattern for aggregation is **binary tree reduction**.  The
+orchestrator submits **all rounds of the tree upfront** (in a single sequential pass),
+without waiting between rounds.  The tensor map drives the dispatch order automatically.
+
+```
+Orchestrator builds the full tree DAG in one pass:
+
+  Phase 1 — leaf workers (no tensor deps; all immediately READY)
+    submit_worker(leaf_reader, inputs=[], outputs=[L0])     ← rt_l3
+    submit_worker(leaf_reader, inputs=[], outputs=[L1])     ← rt_l3
+    ...
+    submit_worker(leaf_reader, inputs=[], outputs=[L15])    ← rt_l3
+
+  Phase 2 — round 1 pair-sum workers (deps on leaf outputs)
+    submit_worker(pair_sum, inputs=[L0,  L1 ], outputs=[R1_0])   ← rt_l4
+    submit_worker(pair_sum, inputs=[L2,  L3 ], outputs=[R1_1])   ← rt_l4
+    ...
+    submit_worker(pair_sum, inputs=[L14, L15], outputs=[R1_7])   ← rt_l4
+
+  Phase 3 — round 2 pair-sum workers (deps on round-1 outputs)
+    submit_worker(pair_sum, inputs=[R1_0, R1_1], outputs=[R2_0]) ← rt_l4
+    ...
+
+  Phase 4, 5 — further rounds ...
+
+  Root — final worker
+    submit_worker(pair_sum, inputs=[R3_0, R3_1], outputs=[ROOT]) ← rt_l4
+
+  Orchestrator then waits: root_future.get()
+```
+
+Key properties of this pattern:
+
+- The orchestrator submits all `(N − 1)` internal-node workers **before any of them
+  execute**.  No explicit synchronisation between tree rounds is written in the
+  orchestrator.
+- Each `pair_sum_worker` declares exactly **2 tensor-typed inputs** in
+  `TaskDesc::input_handles`.  The scheduler holds it `PENDING` until both inputs
+  are `is_ready() == true`, then promotes it to `READY` and dispatches to a worker
+  thread automatically.
+- Leaf workers and sibling subtrees at the same round execute **in parallel** (up to
+  the worker thread count).  Deeper rounds stall naturally until earlier rounds
+  produce their output tensors — purely through the tensor-map dependency mechanism.
+- The orchestrator function itself is **pure structure** (no compute, no polling):
+  it runs to completion rapidly, having only built the DAG and submitted all workers.
+
+For N leaves and a binary tree:
+
+| Total workers submitted | `N` leaf readers + `N−1` internal nodes |
+|------------------------|------------------------------------------|
+| Tree depth             | `⌈log₂ N⌉` rounds                       |
+| Scheduler decisions    | one PENDING→READY check per internal node |
+| Orchestrator waits     | once, on the root future                |
+
+#### 7.3A-3 Shared Data Structures and Synchronisation Within the Same Process
+
+At each hierarchy level (L3–L7), the orchestrator thread, scheduler thread(s), and
+worker threads all reside in **the same OS process** and therefore share a common
+address space.  This allows zero-copy sharing of runtime state:
+
+| Shared structure      | Owning / writing role    | Reading roles            | Protection mechanism |
+|-----------------------|--------------------------|--------------------------|----------------------|
+| `TensorRegistry`      | Orchestrator (insert), Worker (ready flag) | Scheduler (is_ready) | `std::mutex` + `shared_ptr<atomic<bool>>` for ready |
+| `pending_tasks_`      | Orchestrator (append), Scheduler (drain) | Scheduler              | `std::mutex pending_mu_` |
+| `ready_queue_`        | Scheduler (enqueue)      | Worker (dequeue)         | `std::mutex worker_mu_` + `condition_variable` |
+| `orch_queue_`         | External callers (push)  | Orchestrator (pop)       | `std::mutex orch_mu_` + `condition_variable` |
+| `TaskDesc::state`     | All roles                | All roles                | `std::atomic<TaskState>` with CAS |
+| `Tensor::ready`       | Worker (store release)   | Scheduler (load acquire) | `shared_ptr<atomic<bool>>` with acquire/release |
+
+**Key synchronisation rules (following the simpler L0-L2 approach):**
+
+- **Per-tensor readiness** uses `std::atomic<bool>` with `memory_order_release` on
+  write (by the worker) and `memory_order_acquire` on read (by the scheduler).  This
+  is the exact pattern used by simpler's `STORE_RELEASE` / `LOAD_ACQUIRE` on ring
+  pointer and task state fields in device GM.
+
+- **PENDING → READY promotion** uses `atomic<TaskState>::compare_exchange_strong`
+  (CAS) so that multiple scheduler threads cannot both promote the same task.
+
+- **Queue wakeups** use `std::mutex` + `std::condition_variable` to avoid busy-wait.
+  Workers call `sched_cv_.notify_all()` after marking tensors ready, mirroring the
+  way simpler's scheduler wakes up when the orchestrator advances `current_task_index`.
+
+- **Cross-level tensor readiness** (a tensor produced by an L3 worker unblocking an L4
+  task) propagates automatically because the `Tensor::ready` shared_ptr is shared
+  across runtime instances.  The L4 scheduler detects the flag change on its next
+  wakeup (short `wait_for` timeout), without any explicit cross-runtime notification.
+
+- **TensorHandle values must be globally unique** across all hierarchy levels within
+  the same process.  Each level uses the same global atomic handle counter to avoid
+  collisions: if L3 and L4 both allocate from their own per-level counter starting at 1,
+  a tensor produced at L3 (handle=1) and the output tensor at L4 (also handle=1) would
+  collide in L4's TensorRegistry, causing the scheduler to skip registering the L3
+  dependency and the DAG edge to be silently lost.  Using a single process-wide atomic
+  counter guarantees uniqueness without coordination overhead.
+
+- **Mutex scopes are kept short**: the scheduler collects tasks to dispatch under
+  `pending_mu_`, then releases the lock before calling `enqueue_ready`, to avoid
+  holding two locks simultaneously.
+
+### 7.4 Three-Tier Communication Architecture
+
+The Linqu hierarchy has **three fundamentally different communication tiers**, each with distinct memory models, synchronization mechanisms, and performance characteristics:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Tier 3: Message Passing (L4–L6 ↔ L3)                              │
+│  Unix Socket / TCP / RDMA                                           │
+│  Serialized messages: CALL_TASK, TASK_COMPLETE, SHUTDOWN            │
+│  Each node: independent process, independent address space          │
+│  No shared state — all coordination via explicit messages           │
+├─────────────────────────────────────────────────────────────────────┤
+│  Tier 2: Host-Device DMA (L3 ↔ L2)                                 │
+│  h2d_copy / d2h_copy                                                │
+│  L3 orchestrator runs on Host CPU (host memory)                     │
+│  L2 scheduler + workers run on Device (device GM)                   │
+│  Data transfer: explicit DMA between host memory and device GM      │
+│  Control: simpler's shared memory header in device GM,              │
+│           orchestrator writes via MMIO / DMA; scheduler reads       │
+├─────────────────────────────────────────────────────────────────────┤
+│  Tier 1: Shared Device GM (L0–L2, intra-chip)                      │
+│  Atomic operations + memory barriers (LOAD_ACQUIRE / STORE_RELEASE) │
+│  Orchestrator + Scheduler + Workers share same GM address space     │
+│  Zero-copy: pointer passing via ring buffers                        │
+│  CAS spinlocks for concurrent fanout list updates                   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### Tier 1: Shared Device GM (L0–L2, managed by `simpler`)
+
+Within a single chip, the `simpler` runtime operates entirely in **device Global Memory (GM)**. The orchestrator, scheduler, and all worker cores share the same physical address space:
+
+- **TaskRing, HeapRing, DepListPool** are allocated in GM and accessed by all components via direct pointer dereference.
+- **Synchronization** uses hardware atomic operations: `__atomic_compare_exchange_n` (CAS) for fanout locks, `__atomic_fetch_add` for refcount updates, `STORE_RELEASE` / `LOAD_ACQUIRE` for ring pointer visibility.
+- **Output buffers** are allocated from the HeapRing and their **real GM addresses** are written back into `Tensor.buffer.addr`. Workers read input data directly from GM pointers — no copies.
+- The scheduler reads `current_task_index` via `LOAD_ACQUIRE` to detect newly submitted tasks, and writes `last_task_alive` via `STORE_RELEASE` for the orchestrator to detect freed ring slots.
+
+This tier has the lowest latency and highest throughput. It is the domain of `simpler` and is **not modified** by the Linqu project.
+
+#### Tier 2: Host-Device DMA (L3 ↔ L2)
+
+The L3 (Host) level runs on the **Host CPU** with **host memory**, while L2 (Chip) operates in **device GM**. These are **different memory domains** — the host CPU cannot directly dereference device GM pointers, and vice versa. Data crosses this boundary via explicit DMA operations:
+
+- **`h2d_copy` (host-to-device):** The L3 orchestrator prepares input tensors in host memory, then issues a DMA transfer to copy them into device GM before dispatching a chip-level task. The `simpler` runtime at L2 sees the data at the device GM address.
+- **`d2h_copy` (device-to-host):** When a chip-level task produces output in device GM, the L3 orchestrator issues a DMA transfer to copy results back to host memory for further processing or forwarding to L4.
+- **Control path:** The `simpler` orchestrator state (ring pointers, task descriptors) resides in device GM. The L3 host-side code writes to it via memory-mapped I/O (MMIO) or DMA, not via direct pointer access. The `PTO2SharedMemoryHeader` provides the interface for this cross-domain control flow.
+
+This means L3's NodeDaemon acts as a **bridge**:
+1. Receives `CALL_TASK` from L4 via Unix socket (Tier 3 message).
+2. Prepares parameters in host memory.
+3. Calls `h2d_copy` to push input data to device GM.
+4. Invokes `simpler`'s orchestration API to submit the task to the chip.
+5. Waits for chip-level completion.
+6. Calls `d2h_copy` to pull results back to host memory.
+7. Sends `TASK_COMPLETE` back to L4 via Unix socket (Tier 3 message).
+
+#### Tier 3: Message Passing (L4–L6 ↔ L3, inter-process)
+
+Above L3, every hierarchy level runs as an **independent OS process** with its **own address space**. There is no shared memory between L4 and L3, between L5 and L4, or between L6 and L5. All coordination is via explicit messages over IPC (Unix domain sockets in verification) or network (TCP/RDMA in production):
+
+- **CALL_TASK:** Serialized message containing kernel name, tensor handles, and scalar parameters. The receiving process creates its own `LinquOrchestratorState` and executes the kernel in its own address space.
+- **TASK_COMPLETE:** Serialized completion status sent back to the dispatching level.
+- **Tensor handles are opaque integers**, not memory addresses. A handle at L4 refers to a logical tensor; the L3 process maps it to an actual host memory buffer independently.
+
+This is the domain of the Linqu distributed runtime (`LinquOrchestratorState`, `RemoteDispatcher`, `NodeDaemon`).
+
+#### Communication Model Summary Table
+
+| Level boundary | Tier | Memory model | Transport | Synchronization | Data transfer |
+|----------------|------|-------------|-----------|-----------------|---------------|
+| L0 intra-core-group | 1 | Shared GM | TPUSH/TPOP DMA | Hardware ring | None (on-chip) |
+| L0–L2 intra-chip | 1 | Shared GM | Direct pointer | Atomics + barriers | Zero-copy via GM pointers |
+| **L2–L3 chip↔host** | **2** | **Host mem ↔ Device GM** | **h2d_copy / d2h_copy** | **DMA completion + MMIO** | **Explicit DMA** |
+| L3–L4 host↔pod | 3 | Independent processes | Unix socket / TCP | Message acknowledgment | Serialized payload |
+| L4–L5 pod↔supernode | 3 | Independent processes | TCP / RDMA | Message acknowledgment | Serialized payload |
+| L5–L6 supernode↔cluster | 3 | Independent processes | TCP | Message acknowledgment | Serialized + compressed |
+
+#### Implications for Runtime Design
+
+1. **Linqu's `LinquOrchestratorState` (L3–L6) does NOT need atomic operations or shared-memory synchronization.** Its `fanout_refcount`, `fanin_refcount`, and task state are local variables in a single process. The `std::mutex` used for the scheduler is for thread safety (recv thread vs. main thread), not for cross-process coordination.
+
+2. **Linqu's TensorMap uses opaque handles, not GM addresses.** This is correct by design — at L3–L6, there is no shared buffer space, so multi-dimensional overlap detection (which operates on physical memory addresses) is unnecessary. Handle-based exact-match tracking is the right approach.
+
+3. **The L3 NodeDaemon is the critical bridge layer.** It must translate between Tier 3 (message-based) and Tier 2 (DMA-based) communication. Future Phase 1 implementation will integrate `simpler`'s `PTO2OrchestratorState` into the L3 daemon with proper `h2d_copy` / `d2h_copy` calls.
+
+4. **Back-pressure at L3–L6 is message-driven**, not shared-memory-driven. When an L4 orchestrator's ring is full, it spins waiting for `TASK_COMPLETE` messages from L3 (which trigger `on_task_complete` → `propagate_completion` → `check_task_consumed` → `try_advance_ring_pointers`). This is fundamentally different from `simpler`'s approach where the orchestrator spins on `LOAD_ACQUIRE(last_task_alive)` in shared memory.
 
 ---
 
@@ -657,13 +927,19 @@ This is the **distributed analog** of single-chip scope exit: each node handles 
 
 ### 11.3 Cross-Level Data Transfer
 
-When a tensor produced at Level 3 (Host) is consumed by a function at Level 0 (Core), the runtime performs a multi-level transfer:
+When a tensor produced at Level 3 (Host) is consumed by a function at Level 0 (Core), the runtime performs a multi-level transfer that crosses the Tier 2 communication boundary (see §7.4):
 
-1. Host ring: tensor lives in `buffer_ring[HOST][d]`.
-2. Chip: runtime DMA-transfers the tensor from host memory to chip HBM, allocating in `buffer_ring[CHIP][d']`.
-3. Core: the InCore function reads from chip memory.
+1. **Host ring (L3, host memory):** tensor lives in `buffer_ring[HOST][d]`, allocated in host DRAM.
+2. **h2d_copy (Tier 2 boundary):** the L3 NodeDaemon issues an `h2d_copy` to transfer the tensor from host memory to device GM. The chip-side runtime allocates space in `buffer_ring[CHIP][d']` within device GM.
+3. **Chip (L2, device GM):** the `simpler` orchestrator sees the data at the device GM address and submits work to cores.
+4. **Core (L0):** the InCore function reads from device GM — zero-copy within the chip (Tier 1).
 
-The hierarchy labels on functions tell the runtime which transfers are needed.
+For the reverse direction (L0 output → L3 consumption):
+1. The core writes output to device GM via `buffer_ring[CHIP][d']`.
+2. The L3 NodeDaemon issues a `d2h_copy` to transfer results from device GM back to host memory.
+3. The tensor is now available in `buffer_ring[HOST][d]` for the L3 orchestrator or forwarding to L4.
+
+The hierarchy labels on functions tell the runtime which transfers are needed. The L3 NodeDaemon is responsible for managing these `h2d_copy`/`d2h_copy` operations automatically based on the data flow direction.
 
 ---
 
@@ -790,21 +1066,24 @@ The plan is structured around two realities:
 
 | Task | Description |
 |------|-------------|
-| 0.1 | **Define the `simpler` adaptation interface.** Document the `simpler` APIs used to submit orchestration functions (Level 2) and InCore functions (Level 0) to a chip. This is a read-only contract: the Linqu runtime calls into `simpler` but does not modify it. The adaptation interface must also document how `simpler` reports task completion so the Linqu runtime can track host-level dependencies. |
-| 0.2 | **Implement the `ChipBackend` adapter.** A thin wrapper that translates Linqu runtime dispatch calls (`level=pl.Level.CHIP`) into `simpler` API calls. This is the only component that directly touches `simpler`. All other Linqu runtime code interacts with this adapter, never with `simpler` directly. If `simpler` later adds Level 1 support, only this adapter needs to be aware. |
+| 0.1 | **Document the `simpler` adaptation interface (read-only study).** Read `simpler`'s source to document the APIs that the future `ChipBackend` adapter will need to call. This is a read-only reference document — no code in `pypto_runtime_distributed` depends on or links `simpler` in Phase 0. |
+| 0.2 | **Design the `ChipBackend` adapter interface (design only in Phase 0).** Define the Tier 2 bridge interface (see §7.4) that will translate Linqu runtime dispatch calls (`level=pl.Level.CHIP`) into `simpler` API calls via dynamic linking. The adapter will manage `h2d_copy` / `d2h_copy` DMA operations, map opaque tensor handles to device GM addresses, and invoke `simpler`'s orchestration API. In Phase 0, L3→L2 dispatch is **stubbed**. The adapter will be implemented in a future phase within `pypto_runtime_distributed` — it does NOT modify `simpler`. |
 | 0.3 | Implement the `RingLayer` class managing `task_ring[L][d]` and `buffer_ring[L][d]` for **Levels 3–6**. Parameterized by hierarchy level `L` (3–6), but only allocate non-zero capacity for `L = 3` in this phase. Levels 4–6 have zero-capacity rings (data structures exist, just empty). For Levels 0–2, `simpler` manages its own rings — the Linqu runtime does **not** duplicate them. |
 | 0.4 | Implement the `ScopeManager` for **host-level and above scopes** (Level 3+). Tracks `current_scope_depth` for Level 3+ scopes, handles `scope.enter` / `scope.exit` / `pl.free` signals at these levels. Chip-level scope depth (within a `simpler` orchestration function) is managed by `simpler` independently. |
-| 0.5 | Implement the `TaskKey` identity model with **full coordinate** `(logical_system, L6..L0, scope_depth, task_id)`. The `L0/L2` portion wraps the `simpler`-internal task identity. In this phase, L4–L6 are always zero, but the struct and all comparisons use the full key. |
+| 0.5 | Implement the `TaskKey` identity model with **full coordinate** `(logical_system, L6..L0, scope_depth, task_id)`. The `L0/L2` portion maps to `simpler`'s internal task identity (via the future `ChipBackend` adapter). In this phase, L4–L6 are always zero, but the struct and all comparisons use the full key. |
 | 0.6 | Implement the retirement scan for Level 3+ rings: layer-local, respects `task_freed` flag, advances `last_task_alive[L][d]`. Level 0–2 retirement is handled by `simpler`. |
 | 0.7 | Implement the `LinquCoordinate` struct and `get_my_coordinates(ip)` interface. In this phase, the host populates L3 (and queries `simpler` for chip/core topology to fill L0/L2); L4–L6 default to zero. |
 | 0.8 | Implement `linqu_physical_system_name` and `linqu_logical_system_name` node identity. Even on a single host, the naming is set so that multi-host deployment requires no identity-format change. |
 | 0.9 | Define and implement the `LinquHeader` binary message format (24-byte header) with **all level fields** (`l6_idx`, `l5_idx`, `l4_idx`, `l3_idx`). In this phase, l4–l6 are zero, but the wire format is stable. |
 | 0.10 | Implement the `PeerRegistry` data structure, keyed by `(logical_system, full_coordinate)`. In this phase, it contains only the local host; tested with **mock multi-level topologies** for forward compatibility. |
-| 0.11 | Implement the `pl.at(level=...)` dispatch path. For `L ∈ {0, 1, 2}`: delegate to `simpler` via the `ChipBackend` adapter. For `L = 3`: handle in the Linqu runtime (host-level multi-chip coordination). For `L ∈ {4, 5, 6}`: raise `NotYetSupported` at **runtime**. |
-| 0.12 | Implement host-level multi-chip coordination: the Linqu runtime can submit work to **multiple chips** on the same host by making multiple calls to the `ChipBackend` adapter, managing host-level scope and inter-chip data dependencies. |
+| 0.11 | Implement the `pl.at(level=...)` dispatch path. For `L ∈ {0, 1, 2}`: **stubbed** in Phase 0 (future: delegate to `simpler` via `ChipBackend` adapter, without modifying `simpler`). For `L = 3`: handle in the Linqu runtime (host-level coordination). For `L ∈ {4, 5, 6}`: raise `NotYetSupported` at **runtime**. |
+| 0.12 | Implement host-level coordination: the Linqu runtime manages host-level scope and tracks inter-chip data dependencies. Actual chip dispatch is stubbed in Phase 0; a future `ChipBackend` adapter will enable multi-chip coordination via `simpler`'s ABI. |
 | 0.13 | Implement per-layer ring profiling metrics for Level 3. The metrics framework is parameterized for Levels 3–6. Level 0–2 profiling is `simpler`'s responsibility. |
 | 0.14 | Write **forward-compatibility tests**: unit tests that create `TaskKey` and `LinquCoordinate` objects with non-zero L4–L6 fields, verify serialization/deserialization, ring indexing, and PeerRegistry lookup with full 7-level coordinates. These tests run on the single-host environment using mock data. |
-| 0.15 | Write **`simpler` integration tests**: end-to-end tests that exercise Level 3 → Level 2 → Level 0 dispatch: Linqu runtime creates a host-level scope, submits chip-level work via `ChipBackend`, `simpler` executes it, Linqu runtime tracks completion and retires host-level rings. |
+| 0.15 | Write **end-to-end multi-level tests**: tests that exercise Level 6 → Level 5 → Level 4 → Level 3 dispatch through the multi-process verification environment. L3→L2 dispatch is stubbed. |
+| 0.16 | **(Future phase) Implement `h2d_copy` / `d2h_copy` integration in `ChipBackend`.** The `ChipBackend` adapter (within `pypto_runtime_distributed`) will manage the Tier 2 memory boundary by dynamically linking to `simpler`'s `libhost_runtime.so` — it does NOT modify `simpler`. Tasks: (a) allocate device GM buffers, (b) issue `h2d_copy` to transfer input tensors from host memory to device GM, (c) issue `d2h_copy` to transfer output tensors back, (d) map opaque tensor handles to device GM addresses. |
+| 0.17 | **(Future phase) Write Tier 2 boundary tests**: unit tests verifying correct `h2d_copy` / `d2h_copy` behavior — data integrity, handle-to-address mapping, and buffer lifecycle. |
+| 0.18 | Add **Lingqu DFS hierarchical reduction test** (L7→L3, 1024 L3 nodes): each L3 worker reads one DFS file containing 1024 random numbers, returns local sum to parent level, and the top-level orchestrator prints the global sum aggregated from all children. Use the L3-L7 role-separated thread model (`ORCHESTRATOR`/`WORKER`) and default thread knobs (`Lx_NUM_SCHEDULER_THREADS=1`, `Lx_NUM_WORKER_THREADS=4` in the test). |
 
 ### Phase 1: Multi-Die Chips (Level 1 Added Inside `simpler`)
 
