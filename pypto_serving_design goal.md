@@ -144,6 +144,17 @@
 | 全链路 L7→L6→L5→L4→L3→L2 验证 | 已通过 |
 | 6 个测试用例 | 已通过 |
 
+## Phase 8 实现状态（已完成）
+
+| 组件 | 状态 |
+|------|------|
+| PersistenceManager（Radix 定期刷盘 + KV 持久化） | 已完成 |
+| Radix 元数据 save/load 往返验证 | 已通过 |
+| KV block L1→L3 demote/promote + 文件持久化 | 已通过 |
+| Auto-flush 后台线程 | 已通过 |
+| 压力测试（10 req, 2000 req/s） | 已通过 |
+| 全链路 Perfetto trace（22KB） | 已通过 |
+
 ---
 
 ## 参考文档
