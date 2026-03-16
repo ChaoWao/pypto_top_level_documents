@@ -91,6 +91,17 @@
 | Python E2E 测试（4 个用例 + determinism 验证） | 已通过 |
 | 验收：Python → TestPath → L4→L3 → L2 stub → TestPath → Python | 已通过 |
 
+## Phase 2 实现状态（已完成）
+
+| 组件 | 状态 |
+|------|------|
+| RadixTree（前缀插入/查找/分支/删除/序列化） | 已完成 |
+| KVCacheManager 三层管理（L1 GPU / L2 Host / L3 SSD） | 已完成 |
+| LRU 驱逐策略（L1→L2→L3 逐级降级） | 已完成 |
+| LocalFilePersistence（lingqu_block stub） | 已完成 |
+| LocalRadixPersistence（lingqu_db stub） | 已完成 |
+| 单元测试（14 个用例：前缀/KV/eviction/persistence） | 已通过 |
+
 ---
 
 ## 参考文档
