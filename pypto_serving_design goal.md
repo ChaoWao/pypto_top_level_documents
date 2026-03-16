@@ -124,6 +124,16 @@
 | 完整 serve pipeline + KV tracking | 已通过 |
 | 注：真实 kernel 集成需要 simpler 硬件环境 | — |
 
+## Phase 6 实现状态（已完成 — stub 模式）
+
+| 组件 | 状态 |
+|------|------|
+| golden.py 框架（GoldenCase / GoldenRunner） | 已完成 |
+| TestPath 适配（ctypes inject/get） | 已完成 |
+| 5 个 golden cases（basic/short/single/determinism/longer） | 已通过 |
+| JSON report 输出 | 已完成 |
+| --case / --all / --list / --trace 支持 | 已完成 |
+
 ---
 
 ## 参考文档
