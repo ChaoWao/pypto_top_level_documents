@@ -102,6 +102,18 @@
 | LocalRadixPersistence（lingqu_db stub） | 已完成 |
 | 单元测试（14 个用例：前缀/KV/eviction/persistence） | 已通过 |
 
+## Phase 3 实现状态（已完成）
+
+| 组件 | 状态 |
+|------|------|
+| StopChecker（max_tokens / EOS / stop_sequence） | 已完成 |
+| RequestServer（Radix 查找→Prefill→AR loop→Radix 更新） | 已完成 |
+| ServingSystem::serve() 集成 Radix+KV | 已完成 |
+| 前缀命中验证（第二请求 4-token prefix hit） | 已通过 |
+| KV Cache 分配与引用计数 | 已通过 |
+| Perfetto trace 集成 | 已通过 |
+| 集成测试（8 个用例） | 已通过 |
+
 ---
 
 ## 参考文档
