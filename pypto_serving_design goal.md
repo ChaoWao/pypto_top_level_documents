@@ -80,6 +80,17 @@
 | ServingSystem (顶层生命周期 + trace) | 已完成 |
 | 冒烟测试（L4→L3 prefill→decode 全链路） | 已通过 |
 
+## Phase 1 实现状态（已完成）
+
+| 组件 | 状态 |
+|------|------|
+| TestPath C API（inject_request / get_response） | 已完成 |
+| TestPath 共享库（pypto_testpath.so，供 ctypes 调用） | 已完成 |
+| Python ctypes 绑定（test_path.py / TestPathClient） | 已完成 |
+| C++ 集成测试（wire format + pipeline reuse） | 已通过 |
+| Python E2E 测试（4 个用例 + determinism 验证） | 已通过 |
+| 验收：Python → TestPath → L4→L3 → L2 stub → TestPath → Python | 已通过 |
+
 ---
 
 ## 参考文档
