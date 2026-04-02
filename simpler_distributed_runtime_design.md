@@ -23,16 +23,6 @@ This document synthesizes the following design documents from `simpler/.docs/`: 
 - **Unified Worker model**: Every level's Worker exposes the same `run(task)` blocking interface, fully isomorphic with ChipWorker
 - **Do not modify simpler**: All L3+ design builds on top of simpler's L0-L2, never modifying existing L2 code
 
-### 1.3 Implementation Progress
-
-| Phase | Status | Notes |
-|-------|--------|-------|
-| Phase 0: Pre-built Runtime Binaries | Done | PR #386 |
-| Phase 0.5: TaskArgs Type Refactor | Done | PR #391, #392, #395 |
-| Phase 1a: Callable Type | Done | PR #408, #413 |
-| Phase 1b: ChipWorker | Done | feat/chip-worker branch |
-| **Phase 2: HostWorker (DistWorker)** | **Not started** | Focus of this document |
-
 ---
 
 ## 2. Unified Worker Interface
@@ -381,134 +371,31 @@ The caller does not need to know whether the task is executed by AICore, ChipWor
 
 ---
 
-## 8. Key Types
+## 8. Relationship with the Linqu Distributed Runtime
 
-### 8.1 Type Name Mapping
+The `simpler` runtime is the **implementation** of the Linqu runtime. This design (simpler Phase 2) extends simpler's existing L0-L2 capabilities to L3, as described in [linqu_runtime_design.md](linqu_runtime_design.md) Section 3:
 
-| Document Name | Actual Type Name | Definition Location |
-|---------------|-----------------|---------------------|
-| `TensorArg` | `ContinuousTensor` | `src/common/task_interface/tensor_arg.h` |
-| `SeparatedArgs` | `TaskArgs` | `src/common/task_interface/task_args.h` |
-| `OrchArgs` | `DynamicTaskArgs` | `TaskArgs<ContinuousTensor, uint64_t, 0, 0>` |
-| `OrchArgStorage` | `ChipStorageTaskArgs` | `TaskArgs<ContinuousTensor, uint64_t, 16, 128>` |
+| Layer | Description |
+|-------|-------------|
+| **simpler L0-L2** | Existing chip-level runtime; not modified. ChipWorker calls via dlsym C API |
+| **simpler L3 (this design)** | DistWorker + HostSubWorker; multi-chip host-level coordination |
+| **simpler L4-L6 (future)** | Multi-host distributed coordination; isomorphic extension of L3 |
 
-### 8.2 ChipCallable
-
-ChipCallable replaces the binary payload role of ChipTask, containing the orch function and kernel binaries.
-Invoked via `init_runtime(RuntimeHandle, ChipCallable*, ChipStorageTaskArgs*)` with 3 parameters.
-
----
-
-## 9. Platform Services Layering
-
-### 9.1 Independent .so per Platform Capability Domain
+### Execution Stack
 
 ```
-host_runtime.so   -> L2 runtime execution       (existing)
-host_comm.so      -> Inter-chip communication    (used by L3)
-host_network.so   -> Cross-node networking       (used by L4+, future)
-```
-
-Each level dlopen's only the .so it needs, without intruding on other levels.
-
-### 9.2 Build Artifacts
-
-```
-build/lib/{arch}/{variant}/
-  {runtime}/                         # runtime-dependent
-    host_runtime.so                  # L2
-    aicpu.so
-    aicore.o
-  comm/                              # runtime-independent
-    host_comm.so                     # L3
-```
-
----
-
-## 10. File Layout
-
-### 10.1 C++ Layer
-
-```
-src/common/distributed/                  # Scheduling engine, shared by L3/L4/L5/L6
-  dist_types.h                           # IWorker interface + common types
-  dist_tensormap.{h,cpp}                 # TensorMap
-  dist_ring.{h,cpp}                      # TaskAllocator + RingSet + DepListPool
-  dist_scope.{h,cpp}                     # ScopeManager
-  dist_orchestrator.{h,cpp}              # submit 7-step flow
-  dist_scheduler.{h,cpp}                 # Scheduler thread
-  dist_sub_worker.{h,cpp}               # SubWorker: fork/shm
-  dist_worker.{h,cpp}                    # DistWorker: exposed to Python
-
-src/common/worker/
-  chip_worker.{h,cpp}                    # Existing, used only by L3
-```
-
-### 10.2 Python Layer
-
-```
-python/bindings/
-  task_interface.cpp                     # Existing (data types + ChipWorker)
-  dist_worker_bind.cpp                   # New: DistWorker nanobind bindings
-
-python/
-  task_interface.py                      # Append DistWorker re-export
-  host_worker/
-    __init__.py
-    host_worker.py                       # Thin wrapper, delegates to DistWorker(level=3)
-    host_task.py                         # HostTask dataclass
-```
-
----
-
-## 11. PR Split Plan
-
-### PR 2-1: C++ DistWorker Core + Nanobind Bindings
-
-Add all files under `src/common/distributed/` + nanobind bindings + C++ unit tests.
-
-### PR 2-2: Python HostWorker Wrapper + HostTask + Integration Tests
-
-HostWorker Python thin wrapper + HostTask + mock/sim end-to-end tests.
-
-### PR 2-3: DeviceRunner thread_local + Multi-Device
-
-Change DeviceRunner singleton to thread_local to support multi-device parallelism.
-
-### PR 2-4: Platform comm .so
-
-Independent communication library (separate owner).
-
----
-
-## 12. Relationship with the Linqu Distributed Runtime
-
-This design (simpler Phase 2) corresponds to the L3 extension of simpler's existing capabilities described in [linqu_runtime_design.md](linqu_runtime_design.md) Section 3.1:
-
-| Relationship | Description |
-|-------------|-------------|
-| **simpler L0-L2** | Not modified; ChipWorker calls via dlsym C API |
-| **simpler L3 (this design)** | DistWorker + HostSubWorker, implemented within the simpler repository |
-| **Linqu L3-L6** | pypto_runtime_distributed repository, uses simpler's ChipWorker/DistWorker as execution backend |
-| **Interface integration** | Linqu's `ChipBackend` adapter calls simpler's C API via dlopen/dlsym |
-
-### Recursive Relationship
-
-```
-Linqu L4+ Orchestrator
-    | CALL_TASK (RPC)
-Linqu L3 NodeDaemon
-    | calls simpler Worker API
-simpler DistWorker (L3)
+L4+ DistWorker (future)
+    | submit(DIST, ...) to L3 nodes
+L3 DistWorker (this design)
     | submit(CHIP, ...) / submit(HOST_SUB, ...)
-simpler ChipWorker (L2) / HostSubWorker
-    | C API
-simpler L0-L2 Runtime (executes on device)
+L2 ChipWorker / HostSubWorker
+    | C API / fork+shm
+L0-L2 Runtime (executes on device)
 ```
 
 ---
 
-## 13. Design Highlights Summary
+## 9. Design Highlights Summary
 
 1. **Unified IWorker interface** — ChipWorker / SubWorker / DistWorker all implement the blocking `run(payload)` interface
 2. **Fork before threading** — HostSubWorker forks in `__init__()`, before C++ threads start
