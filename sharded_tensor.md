@@ -1,0 +1,253 @@
+# `sharded_tensor`: Symmetric, Rank-Partitioned Storage for pypto Tensors
+
+## Status
+
+This document describes an **experimental** design direction for a new value type, `sharded_tensor`, in pypto. It is written for **design review** by the pypto team. After the team approves the model and any adjustments to the details below, we will track implementation work to promote it to a **supported, full** feature in the type system, compiler, runtime, and tools.
+
+## Overview
+
+`sharded_tensor` is a **derived type** that **inherits** the semantic and metadata surface of the ordinary `tensor` type, and at the same time **inherits the symmetric shared-memory model** from the **open share memory** specification. Logically, a `sharded_tensor` represents a single global tensor. Physically, its **backing storage** is not monolithic on one node: it is **evenly split** across `rank_num` participants so that each rank holds **1 / rank_num** of the total byte size of the tensor, under the symmetric shared-memory contract.
+
+Inherits:
+
+| From | What carries over |
+|------|-------------------|
+| `tensor` | Logical shape, `dtype`, optional `tile_shape` and other tensor metadata, indexing semantics, and the programmer-visible tensor API (subject to rank-aware restrictions defined later). |
+| `open_share_memory` (symmetric) | **Symmetric** share memory: every participating process sees the same **addressing contract** and naming of ranks; collective creation and access rules align with the open share memory spec. |
+
+`sharded_tensor` is **not** a replacement for local GM tensors. It is an additional type for programs that are compiled and executed in a **multi-rank, symmetric shared-memory** environment.
+
+## 1. Open share memory: ranks
+
+In an **open share memory** system, every node that takes part in symmetric sharing is identified by:
+
+| Name | Meaning |
+|------|--------|
+| `rank_id` | The identifier of this participating node, in `0 .. rank_num - 1` (exact inclusive range is defined by the open share memory spec; this document assumes zero-based contiguous ranks unless otherwise specified). |
+| `rank_num` | The **total** number of sharing nodes in the partition. All sharded tensors in a given program region agree on the same `rank_num` (or a compatible subset model if the spec allows subgroups; **subgroups are out of scope** unless the team extends this document). |
+
+Symmetric shared memory **coordinates** (allocation, mapping, and visibility) are defined by the open share memory layer. `sharded_tensor` **does not redefine** the low-level mechanics; it **binds** tensor metadata to that layer so the compiler and runtime can reason about **which rank owns which slice** of storage and how the **logical whole tensor** is reassembled for semantics and (where applicable) debugging or verification.
+
+## 2. `sharded_tensor` vs ordinary `tensor`
+
+A **host / ordinary `tensor`** (in the single-node or monolithic-storage sense) has a single contiguous (or strided) storage blob whose size is determined by `shape`, `dtype`, and layout (e.g. row-major or `tile_shape`-driven layout as in [Tensor `tile_shape`](tensor_layout.md)).
+
+A **`sharded_tensor`** has the **same logical metadata** as a tensor: `shape`, `dtype`, optional `tile_shape` for GM tile layout where applicable, strides/device placement metadata as defined by the implementation, and so on. The **difference** is **where the bytes live**:
+
+- **Total element count** (and total byte size for a given layout) is still determined by the **global** `shape` and `dtype` (and layout).
+- **Physical storage** is **evenly** distributed: each of the `rank_num` ranks provides storage for **exactly** **1 / rank_num** of the **total** tensor size (in bytes), under the symmetric allocation policy.
+
+**Uniform split assumption (design default).** The intended default is an **even byte-wise** partition. If a future need arises for **non-uniform** rank slices, that would be a separate design (not implied by this version of `sharded_tensor`).
+
+**Relationship between global shape and per-rank footprint.** For a global shape `S = (s0, s1, ..., s_{d-1})` and element size `E`, the total size is `prod(S) * E` bytes. Each rank holds `prod(S) * E / rank_num` bytes. The **concrete mapping** from global indices to `(rank_id, local offset)` is a **separate, rank-ordering policy** (e.g. linear partition along the last dimension, block-cyclic, etc.); this document only **requires** that the partition be **symmetric in responsibility** (each rank **1 / rank_num**) and **documented** in a follow-on section once the team picks a default algorithm.
+
+## 3. The `rank_shape` attribute
+
+In addition to the standard tensor fields **`shape`** and optional **`tile_shape`**, a `sharded_tensor` carries **`rank_shape`**.
+
+| Field | Role |
+|-------|------|
+| `shape` | The **global** logical shape of the entire sharded tensor. The union of all ranks' contributions **logically** covers this shape. |
+| `tile_shape` | Optional, same meaning as for GM tensors: physical tile shape for tile-contiguous layout, when the backend uses it. See [Tensor `tile_shape`](tensor_layout.md). |
+| `rank_shape` | The **per-rank logical shape** (or shape **fraction**) whose **product** × `sizeof(dtype)` × layout overhead matches the **1 / rank_num** storage fraction on that rank, **consistent** across ranks up to a **reordering of dimensions** that the spec may allow. In the simplest case, `rank_shape` is literally `shape` with one or more dimensions divided by `rank_num` (or a factor that yields an integer), so that `prod(rank_shape) * rank_num == prod(shape)` when a simple replication-free partition along one axis is used. |
+
+**Intended meaning.** `rank_shape` answers: *"What is the **tensor-shaped footprint** of **my** piece on this `rank_id` in the same dimension order as `shape`?"* It is **not** a second global shape; it is a **per-rank slice description** in **shape** form, such that the **combination** of all ranks' stored pieces (under the chosen partition rule) **covers** the full `shape` without overlap.
+
+**Example (illustrative, not normative for index mapping).** Global `shape = (1024, 1024)` and `rank_num = 4` might use `rank_shape = (256, 1024)` if the partition is along the first dimension, so that each rank stores a contiguous 256×1024 slab. Another policy might use `rank_shape = (1024, 256)` for a partition along the second dimension. The team must **fix one default** in the full specification to avoid silent divergence between compiler and runtime.
+
+**Consistency rules (draft for review).**
+
+1. `len(rank_shape) == len(shape)`.
+2. For every dimension `i`, `shape[i] % rank_shape[i] == 0` **in the default uniform partition** (or the spec states how remainder ranks are handled if `shape` is not divisible; **remainder policy is open** until the team decides).
+3. The **sum over ranks of the per-rank element count** must equal the **global** element count `prod(shape)`.
+
+## 4. Inheritance and API surface (design sketch)
+
+- **Type relationship:** `sharded_tensor` is a **subtype** (derivative class) of `tensor` in the type system, with **additional** constraints and **additional** metadata (`rank_id` context, `rank_num`, `rank_shape`, and a reference to symmetric shared-memory handle as required by `open_share_memory`).
+
+- **Behavior:** Operations that only need **local** data (the rank's slice) can be defined naturally. Operations that need a **global** view may require **collective** or **runtime-assisted** materialization, or are **rejected** at compile time. The **exact** split of allowed ops is for the pypto design review to decide.
+
+- **Interoperability with `tensor`:** Converting `tensor` ↔ `sharded_tensor` may require **copy** or **collective** placement; a **view** of one rank’s slice as a local `tensor` is a common pattern if the open share memory model exposes a local base pointer and length for each rank.
+
+## 5. Access semantics: subtensor extraction is keyed by `rank_id`
+
+A `sharded_tensor` is **always accessed with respect to a specific `rank_id`**. The global tensor is logically one object, but its **bytes are partitioned across ranks**, and any operation that **selects, reshapes, or otherwise extracts a sub-region** must say **whose share** it is talking about.
+
+### 5.1 Subtensor extraction takes an explicit `rank_id` argument
+
+Every layout / extraction op on a `sharded_tensor` carries an **additional `rank_id`** argument that is **not** present on the corresponding op for an ordinary `tensor`. This applies to (at minimum):
+
+- `view`
+- `reshape` (both shallow and deep variants — see [Tensor `tile_shape`](tensor_layout.md))
+- `slice`, indexing, and any other subtensor extraction op
+- `transpose`, `permute`, `expand`, and other layout/view operations the surface API exposes
+- conversion to a local `tensor` view of the slice
+
+The `rank_id` argument **selects which rank's 1 / rank_num share is being operated on**. The op produces a result whose semantics are defined **only with respect to that rank's slice**; the operation does **not** implicitly fan out across all ranks.
+
+```python
+# Sketch (illustrative; final API names are TBD)
+ST = pl.sharded_tensor(shape=(M, N), dtype=pl.fp16, rank_shape=(M / rank_num, N))
+
+# Extract a (16, 16) tile from rank 3's slice — explicit rank_id is required.
+local_tile = ST.view(rank_id=3, region=((r0, r0+16), (c0, c0+16)))
+
+# Reshape rank 0's slice — again, rank_id is part of the call.
+local_view = ST.reshape(rank_id=0, new_shape=(...))
+```
+
+### 5.2 One rank at a time
+
+The presence of `rank_id` on every extraction op is **not** an optional convenience — it is the **access discipline** of `sharded_tensor`. A single call site **operates on exactly one rank's slice**. There is **no fused multi-rank extraction primitive** in this design; if a kernel needs data from several ranks, it issues several extractions, **each** with its own `rank_id`.
+
+This restriction is deliberate:
+
+- It keeps the **addressing model explicit**: the programmer (and the compiler) always know **which** physical bytes are being read or written.
+- It avoids implicit collective traffic: a one-line `view` cannot accidentally generate an all-ranks broadcast or gather.
+- It maps **one-to-one** onto the underlying open-share-memory access primitives (described next), which are themselves **point-to-point** between the issuing rank and one remote rank.
+
+### 5.3 Lowering: pypto translates extraction into open-share-memory API calls
+
+**Underlying implementation in the simpler runtime.** The simpler runtime is free to implement `sharded_tensor` storage, mapping, and access **using an open-shared-memory implementation that runs over the Unified bus** (or equivalent transport in the target machine model). That is, the **byte movement and addressability** for the rank-partitioned storage is provided by the same open-share-memory layer that the construction-time barrier in §6.2 already relies on.
+
+**pypto's responsibility.** Given a high-level extraction op such as `ST.view(rank_id=k, ...)` or `ST.slice(rank_id=k, ...)`:
+
+1. The pypto compiler **resolves** the op against the `sharded_tensor`'s metadata (`shape`, `tile_shape`, `rank_shape`, the partition rule) to determine **which bytes on rank `k`** are being addressed.
+2. The compiler **lowers** the extraction to a **sequence of low-level open-share-memory API calls** that, when executed at the issuing rank, **copy data from / to the remote rank `k`'s** (or, when `rank_id` equals the local rank, the rank's own) local share. Read-style ops emit remote-read / pull-style transfers; write-style ops emit remote-write / push-style transfers; in-place views over **the same rank as the issuing one** can avoid copies entirely and use a local pointer.
+3. The compiler **honors the construction-time readiness invariant**: the lowered transfers are emitted **only on program paths where the construction barrier (§6.2) has completed**, so every dereferenced byte is guaranteed to be published in the open-share-memory address space.
+4. The resulting transfers are scheduled / interleaved with the rest of the rank's local computation by the simpler runtime, the same way other GM↔SRAM transfers are scheduled today; the **fact** that the source / destination is a remote rank is, at this layer, just another route in the open-share-memory address space.
+
+Operations that do **not** move data — pure metadata reshapes that do not change byte layout, for example — may be lowered to **no transfer at all**, just a metadata update. Whether a given reshape is metadata-only on a `sharded_tensor` follows the same rules as for an ordinary GM tensor (see the warnings in [Tensor `tile_shape`](tensor_layout.md) §4.1 about layout-affecting operations), with the additional constraint that the metadata change is scoped to **rank `rank_id`'s** slice only.
+
+### 5.4 What this implies for the user
+
+- The user **must** supply `rank_id` whenever they extract from a `sharded_tensor`. Forgetting it is a **type / API error**, caught by the compiler.
+- The user can **read or write any rank's slice** (subject to the program's higher-level synchronization and memory-model rules), but **only one rank's slice per call**.
+- The cost of the extraction depends on locality: extraction with `rank_id == self_rank` is local; extraction with `rank_id != self_rank` is a remote transfer over the open-share-memory transport.
+
+## 6. Allocation, scope, and lifecycle (collective semantics)
+
+### 6.1 Where it is allocated: same as a normal `tensor`
+
+A normal `tensor` (other than externally-referenced tensor memory, which is brought in by reference and **not** allocated by pypto) is **defined and allocated as a local variable** of an **orchestrator** function or an **incore** function. These tensors are placed in the **ring hierarchy** according to the **grammatical scope** at which they are introduced — see [`machine_hierarchy_and_function_hierarchy.md`](machine_hierarchy_and_function_hierarchy.md) (scope depth `d`, `task_ring[d]` / `buffer_ring[d]`, scope-token reclamation), and the runtime details in the runtime design documents in this directory.
+
+`sharded_tensor` is allocated and defined in the **same fashion**: it is introduced as a local variable inside the relevant orchestrator / incore scope, and its **storage slot** is taken from the **scope's ring buffer** at that scope depth, just like a normal `tensor`. The **only** difference at allocation time is **what** the slot holds: the sharded tensor's storage is the rank's **1 / rank_num** local share, and the metadata also carries the `open_share_memory` symmetric-region handle, `rank_id`, `rank_num`, and `rank_shape`.
+
+This means:
+
+- The same scope rules govern when the variable is **in scope** (visible) and when its slot is **eligible** for reclamation (scope exit, `pl.free`, end of `ref_count` etc., as in the ring-buffer model).
+- The tensormap / dependency analysis treats the sharded tensor like any other tensor for **local** producer / consumer reasoning at this rank — the **collective** aspects below add an extra synchronization on top, but **do not** replace the scope/ring lifetime.
+
+### 6.2 Construction: open_share_memory join + global all-to-all sync (blocking)
+
+After a `sharded_tensor` is **defined** at this rank (its local slice has been carved out of the scope ring buffer and its symmetric-memory metadata has been initialized), it must **invoke the `open_share_memory` API** to **join** all ranks together for this tensor. This step:
+
+1. Registers / publishes the rank's local share of the symmetric region with the open-share-memory layer so that **every other rank** can address it using the symmetric addressing contract.
+2. Performs a **global synchronization** — modeled as an **all-to-all** style barrier across **all `rank_num` ranks** — in which every rank announces "**I have finished setting up my share of this `sharded_tensor`**" and waits until **every** other rank has done the same.
+3. Is **blocking**: the constructing program path on each rank does **not** proceed past the construction point until the synchronization is complete. Only after the sync returns does the `sharded_tensor` become **fully ready**: from that moment on, **any rank** is permitted to issue accesses (local or remote-via-symmetric-memory) to **any** part of the tensor under the established addressing contract.
+
+**Why a global, blocking sync is required.** Until every rank has finished its setup, a remote access from rank A into rank B's slice can land on uninitialized / unmapped / not-yet-published memory. A weaker (e.g. pairwise, or non-blocking) synchronization would expose a race window in which the symmetric addressing contract holds at the language level but does not hold at the physical level. The all-to-all barrier closes that window; the **blocking** semantics make the readiness invariant **lexically observable** in the program — once construction returns, the tensor is usable globally, period.
+
+**Where the sync sits relative to the ring buffer.** The local **slot** is allocated **before** the sync (so each rank has something to publish). The slot's **lifetime** in the ring is governed by the ordinary scope/ring rules; the sync only governs **when the global tensor object is observably ready**. Equivalently: the ring has the storage, and the sync converts it from "private byte region at rank i" to "byte region i of a globally addressable sharded tensor".
+
+### 6.3 Retirement: collective vs unilateral (this is genuinely worth deciding now)
+
+**The simplest model** is symmetric: just as construction is global, **retirement is also a global synchronization** — every rank reaches the end-of-life point for the `sharded_tensor` (scope exit, explicit `pl.free`, or equivalent), participates in a barrier, and **all ranks free their share at the same logical instant**. After the barrier, no rank may legally reference the tensor any longer. This mirrors the construction step and gives the cleanest invariant:
+
+> **A `sharded_tensor` is either fully alive at every rank, or fully dead at every rank.**
+
+**However, the question of whether retirement truly needs a global sync deserves explicit review.** A blocking global retirement is not free, and adding it indiscriminately can complicate error handling. We list both directions for the team to choose.
+
+**Arguments for keeping retirement collective (default in this design):**
+
+- **Symmetry with construction.** Construction is collective and blocking; retirement being collective makes the lifetime model uniform and easy to teach.
+- **No "use-after-free across ranks" race.** If rank A keeps the tensor alive for one more access while rank B has already torn down its share, A's remote access through the symmetric-memory contract would target dead memory. A collective barrier removes this hazard by construction.
+- **Simple reclamation of the symmetric region.** The open-share-memory handle and the per-rank slot can be reclaimed as a single coordinated event, without requiring a per-rank "is anyone else still using my share?" protocol.
+- **Easier reasoning for the runtime / tensormap.** Lifetime is a single global event, not a per-rank distributed garbage collection.
+
+**Arguments against / cases where it is overkill (worth thinking through):**
+
+- **Cost on the critical path.** A blocking global barrier at every retirement, when many `sharded_tensor`s are short-lived and locally-only consumed, is potentially expensive.
+- **Error handling complexity.** If one rank fails between construction and retirement (e.g. throws, aborts, or hits a device error), a collective retirement barrier becomes a **distributed cleanup** problem: surviving ranks may block forever waiting for a barrier the failed rank will never enter. Solving this **correctly** typically requires timeouts, fault-tolerant barriers, fencing, or an explicit "kill the whole symmetric region on any rank's failure" policy. Avoiding the collective retirement also avoids needing to specify all of that.
+- **Locally-only access patterns.** If a `sharded_tensor` is **provably** never accessed remotely after a certain program point (e.g. a write-once, locally-read tensor), retirement could in principle be local — but proving "no rank will reach across" in the general case is hard.
+
+**Recommended position for review (not a final decision).** Adopt **collective, blocking retirement** as the default — its symmetry with construction is the largest source of correctness simplification — but **explicitly track error handling** in the design (Section 9) so the team knows the cost. If profiling later shows the global retirement is hot, a follow-up extension can introduce an opt-in "local retirement" mode for tensors with statically-proved no remote access.
+
+### 6.4 Mechanism summary
+
+| Step | What happens locally (per rank) | Global synchronization |
+|------|----------------------------------|------------------------|
+| Allocate | Carve the **1 / rank_num** local share from the scope's ring buffer at the current scope depth `d`; build local metadata (`shape`, `tile_shape`, `rank_shape`, `rank_id`, `rank_num`, open-share-memory handle). | None yet. |
+| Open share memory join | Publish the local share via the `open_share_memory` API. | **All-to-all global barrier**: every rank reports "my share is ready" and waits. **Blocking**; on return, the sharded tensor is **fully ready globally**. |
+| Use | Local and remote accesses are legal under the symmetric addressing contract. | None per access (any cross-rank ordering is a regular memory-model concern, not part of construction). |
+| Retire | Drop scope token / `ref_count` reaches the retirement condition; release the local slot back to the ring. | **Collective barrier (default)**: every rank reaches retirement; after the barrier, the symmetric region's local share is reclaimed on every rank in lockstep. |
+
+## 7. Coexistence with normal and tile-consecutive tensors (programming paradigm)
+
+`sharded_tensor` is **additive**. It does **not** replace, deprecate, or restrict the existing tensor types. The pypto programming paradigm **must continue to support** the definition and allocation of:
+
+- **Normal `tensor`** — the ordinary local tensor (row-major default layout).
+- **Tile-consecutive tensors** — tensors with an explicit `tile_shape` for tile-contiguous physical layout, as defined in [Tensor `tile_shape`](tensor_layout.md).
+
+…**at every layer of the pypto runtime hierarchy**. Concretely (using the level taxonomy in [`machine_hierarchy_and_function_hierarchy.md`](machine_hierarchy_and_function_hierarchy.md)):
+
+| Layer | Normal `tensor` and tile-consecutive `tensor` allowed? |
+|-------|--------------------------------------------------------|
+| Host / orchestrator scope | Yes |
+| Cluster-level scope | Yes |
+| InCore-level scope (and AIC / AIV functions derived from it) | Yes |
+| Any other current or future hierarchy layer | Yes |
+
+**Locality of these tensors.** Normal `tensor`s and tile-consecutive `tensor`s are **allocated locally** to the layer / process they are defined in. They have **no ability to be shared across nodes**: their bytes live on a single node, their addresses are not published into the open-share-memory address space, and they are **not** subject to the construction / retirement barriers in §6.
+
+**Relationship to `sharded_tensor`.** The cross-node sharing capability is **exclusive to `sharded_tensor`**. If a program needs cross-node addressable storage, it must use `sharded_tensor` and pay the collective construction / retirement cost; otherwise, the existing local tensor types remain the default and are fully available without any change in semantics or cost.
+
+This separation keeps the local tensor pipeline (allocation, reclamation via the ring buffer at scope depth `d`, codegen for `TLOAD` / `TSTORE`) **untouched** by the introduction of `sharded_tensor`. The compiler tells them apart by **type**, not by inferring intent from access patterns.
+
+## 8. Impact (placeholder for follow-on work)
+
+After the design is accepted, the following areas will need coordinated updates (mirroring the structure in [Tensor `tile_shape`](tensor_layout.md)):
+
+- **Type system and IR** — new tensor variant with `rank_shape` and symmetric-memory linkage; `rank_id` argument added to extraction / layout ops on `sharded_tensor` (§5).
+- **Compiler** — legality of ops on `sharded_tensor`, propagation of `rank_shape` and global `shape`, codegen for addressing within the local slice, and **lowering of `rank_id`-keyed extraction ops to open-share-memory API calls** (see below).
+- **Runtime (simpler runtime)** — see dedicated subsection below.
+- **PTOAS / device code** — as needed, if `sharded_tensor` is visible in kernel arguments or lowered device buffers.
+
+### 8.1 Simpler runtime: open shared-memory over Unified bus
+
+The simpler runtime is the natural home for `sharded_tensor`'s underlying mechanics:
+
+- **Storage and addressability.** Implement `sharded_tensor`'s rank-partitioned storage **using the open shared-memory layer over the Unified bus**. Each rank's local share is registered with the open-share-memory layer at construction time; remote ranks address it through the open-share-memory address space.
+- **Construction and retirement collectives.** Provide the **all-to-all blocking barrier** at construction (§6.2) and the **collective retirement barrier** at the retirement event (§6.3, default), riding the same transport.
+- **Extraction lowering target.** Expose the **low-level open-share-memory API** (point-to-point copy from / to a remote rank's published region, plus local-pointer access when `rank_id == self_rank`) that the pypto compiler targets when it lowers `view` / `reshape` / `slice` / etc. on a `sharded_tensor` (§5.3). Each high-level extraction call becomes one or more such API calls, with byte addresses derived from `shape`, `tile_shape`, `rank_shape`, and `rank_id`.
+- **Tensormap interaction.** Continue to use the **logical** tensor extents (and per-rank slice extents from `rank_shape`) for overlap and dependency reasoning at this rank; the **collective** events (construction / retirement barriers) appear as additional happens-before edges in the schedule but do not change overlap analysis on the local tensor side.
+- **Coexistence with local tensors.** The simpler runtime **must** preserve today's allocation / reclamation paths for normal `tensor`s and tile-consecutive `tensor`s at every hierarchy layer (§7). The shared-memory machinery is invoked **only** for `sharded_tensor` instances.
+
+## 9. Open questions (for design review)
+
+1. **Default partition** — one-dimensional split vs multi-dimensional, and divisibility when `prod(shape) % rank_num != 0`.
+2. **`tile_shape` interaction** — can `rank_shape` and `tile_shape` be specified together with a **single** clear layout, or do we require `rank_shape` to be tile-aligned in all dimensions when `tile_shape` is set?
+3. **Subgroup / partial participation** — whether `sharded_tensor` is allowed only in **world**-wide `rank_num` or in MPI-style subgroups.
+4. **Naming** — current proposal is `sharded_tensor`; alternatives previously considered include `symmetric_tensor`, `shared_tensor`, and `distributed_tensor`. Final naming should align with the **open share memory** document’s terminology.
+5. **Is a global sync at retirement truly necessary?** See Section 6.3. The default proposal is **yes** (symmetry with construction, no cross-rank use-after-free), but the cost on the critical path and the **distributed error-handling** implications (what happens to a collective retirement barrier when one rank has already failed?) are non-trivial. Possible alternatives the team should rule on:
+   - **(A)** Collective, blocking retirement (default proposal).
+   - **(B)** Collective retirement, but with a defined timeout / fault model (requires specifying a fault-tolerant barrier and a failure policy for the symmetric region).
+   - **(C)** Local retirement permitted only for tensors statically proven to have **no remote access** after the retirement point; collective retirement otherwise.
+6. **Failure semantics** — independently of (5), what happens if any rank fails **between** construction sync and retirement? Options span "abort the whole job", "tear down the symmetric region globally", or "fence the failed rank and continue at remaining ranks (advanced; almost certainly out of scope for the experimental version)".
+7. **Sync primitive** — whether to mandate an actual **all-to-all** at construction or accept any **all-ranks barrier with publication** that the open-share-memory layer offers, as long as it provides the same readiness guarantee. The user-visible contract is the same; the implementation cost is not.
+
+## Summary
+
+| Concept | Description |
+|--------|-------------|
+| `sharded_tensor` | Derived from `tensor`, with symmetric open-share-memory **partitioned** backing storage. |
+| `rank_id` / `rank_num` | Open share memory: which node, how many nodes. |
+| Storage per rank | **1 / rank_num** of total tensor bytes (even split by default). |
+| `shape` / `tile_shape` / `rank_shape` | Global logical shape, optional physical tile shape, and **per-rank** shape of this rank’s stored fraction (together covering the full tensor). |
+| Allocation | Same as a normal `tensor`: local variable of an orchestrator / incore function; placed in the **scope ring buffer** at the relevant scope depth. |
+| Construction sync | After local setup, invoke `open_share_memory` API; **global all-to-all blocking barrier** across all `rank_num` ranks; tensor becomes **fully ready globally** only after the barrier returns. |
+| Retirement sync | Default: **collective, blocking** global barrier so every rank releases its share at the same logical instant — under explicit review (Section 6.3 / Q5) for cost and error-handling complexity. |
+| Access semantics | All extraction / layout ops (`view`, `reshape`, `slice`, …) take an explicit **`rank_id`** argument and operate on **one rank's slice at a time**. |
+| Lowering | The pypto compiler converts `rank_id`-keyed extraction into **low-level open-share-memory API calls** that copy data to / from the target rank; the simpler runtime implements this via **open shared-memory over the Unified bus**. |
+| Coexistence | Normal `tensor`s and **tile-consecutive** `tensor`s remain definable / allocatable at **every** layer of the pypto runtime hierarchy; they are local-only and cannot be shared across nodes. |
+| **Status** | **Experimental** design; **not** a committed product feature until the pypto team approves and implementation planning completes. |
