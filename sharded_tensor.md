@@ -17,6 +17,41 @@ Inherits:
 
 `sharded_tensor` is **not** a replacement for local GM tensors. It is an additional type for programs that are compiled and executed in a **multi-rank, symmetric shared-memory** environment.
 
+## Why this is experimental: applicability uncertainty
+
+At the time of writing, the author is **not certain** that `sharded_tensor` is materially useful for **mainstream AI training and serving systems** — the kinds of workloads exemplified by Megatron-LM-style training and vLLM / SGLang-style decode / prefill serving. The remainder of this section explains why this uncertainty exists, so that the design review can either point at a concrete workload that justifies the feature or, equivalently, scope it down or defer it.
+
+### The dominant cross-rank pattern in AI today is collective communication, not direct remote access
+
+The common parallelization schemes used in AI model training and serving — **DP** (data parallel), **TP** (tensor parallel), **PP** (pipeline parallel), **EP** (expert parallel for MoE), and **SP** (sequence parallel) — express cross-rank data movement as **explicit collective communication operations**, **not** as direct remote memory load / store or `TLOAD` / `TSTORE` against another rank's bytes:
+
+| Scheme | What is split | Dominant cross-rank operation | Implemented as |
+|--------|--------------|------------------------------|----------------|
+| DP     | The mini-batch | gradient sync: **all-reduce** (or **reduce-scatter + all-gather** in ZeRO-1/2/3) | NCCL / equivalent collective library |
+| TP     | Weight matrices (Megatron column-/row-parallel linears, attention heads) | **all-reduce** in forward / backward, **all-gather** for some layouts | NCCL / equivalent collective library |
+| PP     | The layer stack | activations across stage boundary: **point-to-point send / recv** (1F1B, interleaved 1F1B) | NCCL P2P / equivalent |
+| EP     | The set of experts in MoE | dispatch / combine: **all-to-all** | NCCL all-to-all / equivalent |
+| SP     | The sequence dimension (combined with TP in Megatron-SP) | **all-gather** / **reduce-scatter** | NCCL / equivalent collective library |
+
+In each case the cross-rank data movement is **collective by construction**: the schedule, the staging buffers, and the bandwidth model all assume a **single fused operation across (a subset of) ranks**, executed by an optimized library implementation. The compute kernels themselves do **not** dereference remote bytes — they read from and write to **local** buffers that the collective has already populated.
+
+### What this means for `sharded_tensor`
+
+Direct, per-element / per-tile **remote shard access** — exactly what `sharded_tensor` is designed to express — is **not** a primitive that mainline Megatron-LM training or vLLM-style decode / prefill serving currently asks for. Their cross-rank traffic is shaped to fit **collectives** specifically because (a) collectives have predictable bandwidth and overlap behavior, (b) they are implemented by hand-tuned libraries, and (c) refactoring kernels to issue irregular remote loads / stores has historically not paid off on the interconnect models that dominate the field.
+
+This raises an honest question for the design review: **is there a workload pypto needs to support, today or in the near term, for which expressing cross-rank access as a collective is awkward or insufficient?** Plausible candidates that are **worth evaluating** but **not yet confirmed** include:
+
+- **Irregular cross-rank lookups** that do not fit the all-to-all dispatch / combine pattern — e.g. routing schemes where the destination set is data-dependent at fine granularity.
+- **Prefix-shared KV caches** in serving, when prefix bytes are physically resident on a rank that is not the consuming rank.
+- **MoE expert-weight access** or other "fetch a small piece from a known rank" patterns where building a full all-to-all is wasteful.
+- **Custom fused kernels** that interleave compute and remote-byte access in a way that no off-the-shelf collective expresses cleanly.
+
+If one or more of these turns out to be a real, measurable pypto requirement, `sharded_tensor` is the right primitive to express it. If not, the feature should remain experimental until such a workload is identified — or be deferred.
+
+### Implication for the design and the implementation
+
+Because the applicability is uncertain, this document is intentionally **descriptive** of the **shape** of the feature (type system, lifecycle, access semantics, lowering, simpler-runtime support) rather than prescriptive about a rollout schedule. **Implementation work should not begin solely on the strength of this design**; a **concrete target workload** must accompany any decision to promote `sharded_tensor` from **experimental** to a supported, on-by-default feature.
+
 ## 1. Open share memory: ranks
 
 In an **open share memory** system, every node that takes part in symmetric sharing is identified by:
@@ -274,6 +309,7 @@ The simpler runtime is the natural home for `sharded_tensor`'s underlying mechan
    - **(C)** Local retirement permitted only for tensors statically proven to have **no remote access** after the retirement point; collective retirement otherwise.
 6. **Failure semantics** — independently of (5), what happens if any rank fails **between** construction sync and retirement? Options span "abort the whole job", "tear down the symmetric region globally", or "fence the failed rank and continue at remaining ranks (advanced; almost certainly out of scope for the experimental version)".
 7. **Sync primitive** — whether to mandate an actual **all-to-all** at construction or accept any **all-ranks barrier with publication** that the open-share-memory layer offers, as long as it provides the same readiness guarantee. The user-visible contract is the same; the implementation cost is not.
+8. **Concrete target workload (the experimental gate).** See **"Why this is experimental: applicability uncertainty"** near the top of this document. Common AI parallelism schemes (DP / TP / PP / EP / SP) express cross-rank data movement as **collective communication**, not as direct remote shard access. Before promoting `sharded_tensor` past the experimental stage, the team should identify **at least one concrete pypto workload** for which expressing the cross-rank access as a collective is **demonstrably awkward or insufficient**, and where `sharded_tensor`-style direct access yields a measurable improvement. Without such a workload, the recommendation is to **keep this feature experimental** (or defer it).
 
 ## Summary
 
@@ -289,4 +325,5 @@ The simpler runtime is the natural home for `sharded_tensor`'s underlying mechan
 | Access semantics | Extraction / layout ops (`view`, `reshape`, `slice`, …) take a **`rank_id`** argument and operate on **one rank's slice at a time**. **`rank_id` may be omitted for own-share access** — the local slice is then handled as a **normal `tensor`**. |
 | Lowering | Local case: normal tensor codegen. Remote case: in the **preferred UB embodiment**, direct CPU load/store or MTE `TLOAD` / `TSTORE` against the **`ubmem import`-mapped** local base address of the target rank (set up at construction time); fallback on non-UB platforms is **synchronous or asynchronous `open_share_memory` API calls**. |
 | Coexistence | Normal `tensor`s and **tile-consecutive** `tensor`s remain definable / allocatable at **every** layer of the pypto runtime hierarchy; they are local-only and cannot be shared across nodes. |
-| **Status** | **Experimental** design; **not** a committed product feature until the pypto team approves and implementation planning completes. |
+| Applicability | **Uncertain.** Mainstream AI training (Megatron-LM-style) and serving (vLLM / SGLang-style) workloads express cross-rank traffic as **collectives** (all-reduce / all-gather / reduce-scatter / all-to-all / P2P send-recv), not as direct remote shard access. Promotion past experimental requires identifying a concrete target workload (see **Why this is experimental** and Open question Q8). |
+| **Status** | **Experimental** design; **not** a committed product feature until the pypto team approves, a concrete target workload is identified, and implementation planning completes. |
