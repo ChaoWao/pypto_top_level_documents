@@ -71,7 +71,7 @@ In addition to the standard tensor fields **`shape`** and optional **`tile_shape
 
 ## 5. Access semantics: subtensor extraction is keyed by `rank_id`
 
-A `sharded_tensor` is **always accessed with respect to a specific `rank_id`**. The global tensor is logically one object, but its **bytes are partitioned across ranks**, and any operation that **selects, reshapes, or otherwise extracts a sub-region** must say **whose share** it is talking about.
+A `sharded_tensor` is **always accessed with respect to a specific `rank_id`**. The global tensor is logically one object, but its **bytes are partitioned across ranks**, and any operation that **selects, reshapes, or otherwise extracts a sub-region** must say **whose share** it is talking about — with one shorthand: when a rank accesses **its own share**, `rank_id` may be omitted (it defaults to `self_rank`), in which case the slice is treated as a **normal `tensor`** (see §5.1).
 
 ### 5.1 Subtensor extraction takes an explicit `rank_id` argument
 
@@ -96,9 +96,19 @@ local_tile = ST.view(rank_id=3, region=((r0, r0+16), (c0, c0+16)))
 local_view = ST.reshape(rank_id=0, new_shape=(...))
 ```
 
+**Local-share shorthand: `rank_id` may be omitted when a rank accesses its own share.** When a rank accesses **its own slice** of the `sharded_tensor` (i.e. `rank_id == self_rank`), the `rank_id` argument **may be omitted**; equivalently, when omitted, `rank_id` is **defaulted to `self_rank`**. Under this shorthand, the result is, from the compiler's and the kernel's perspective, **just a normal `tensor`** view of the local share: the standard tensor APIs (`view`, `reshape`, `slice`, `TLOAD` / `TSTORE`, ...) apply with their **ordinary** signatures, the same layout / `tile_shape` rules apply, and **no remote transport or symmetric-memory machinery is involved**. This is what makes consuming one's own share cheap inside an InCore kernel: the compiler treats the local slice indistinguishably from a normal local tensor allocated at this rank.
+
+```python
+# Local-share shorthand — rank_id omitted; result is a normal tensor view.
+local = ST.view(region=((r0, r0+16), (c0, c0+16)))           # implicitly rank_id=self_rank
+
+# Equivalent explicit form.
+local = ST.view(rank_id=self_rank, region=((r0, r0+16), (c0, c0+16)))
+```
+
 ### 5.2 One rank at a time
 
-The presence of `rank_id` on every extraction op is **not** an optional convenience — it is the **access discipline** of `sharded_tensor`. A single call site **operates on exactly one rank's slice**. There is **no fused multi-rank extraction primitive** in this design; if a kernel needs data from several ranks, it issues several extractions, **each** with its own `rank_id`.
+The `rank_id`-keyed model (with the own-share shorthand of §5.1) is the **access discipline** of `sharded_tensor`: a single call site **operates on exactly one rank's slice** — either the local rank (when `rank_id` is omitted or equals `self_rank`) or one specific remote rank. There is **no fused multi-rank extraction primitive** in this design; if a kernel needs data from several ranks, it issues several extractions, **each** with its own `rank_id` (or each implicitly local).
 
 This restriction is deliberate:
 
@@ -106,24 +116,52 @@ This restriction is deliberate:
 - It avoids implicit collective traffic: a one-line `view` cannot accidentally generate an all-ranks broadcast or gather.
 - It maps **one-to-one** onto the underlying open-share-memory access primitives (described next), which are themselves **point-to-point** between the issuing rank and one remote rank.
 
-### 5.3 Lowering: pypto translates extraction into open-share-memory API calls
+### 5.3 Lowering: local stays as a normal tensor, remote goes through `open_share_memory` APIs
 
-**Underlying implementation in the simpler runtime.** The simpler runtime is free to implement `sharded_tensor` storage, mapping, and access **using an open-shared-memory implementation that runs over the Unified bus** (or equivalent transport in the target machine model). That is, the **byte movement and addressability** for the rank-partitioned storage is provided by the same open-share-memory layer that the construction-time barrier in §6.2 already relies on.
+The lowering of an extraction op depends on whether `rank_id` resolves to the **local** rank or to a **remote** rank.
 
-**pypto's responsibility.** Given a high-level extraction op such as `ST.view(rank_id=k, ...)` or `ST.slice(rank_id=k, ...)`:
+**Local case (`rank_id == self_rank`, including the omitted-`rank_id` shorthand).** No transport is involved. The compiler treats the result as a **normal `tensor`** view of the local share, lowers it via the **standard** tensor codegen path (load/store, `TLOAD` / `TSTORE`, and any tile-shape-driven addressing per [Tensor `tile_shape`](tensor_layout.md)), and applies the same layout / aliasing rules as for any other local tensor. There is **no `open_share_memory` call** in the emitted code for this path.
 
-1. The pypto compiler **resolves** the op against the `sharded_tensor`'s metadata (`shape`, `tile_shape`, `rank_shape`, the partition rule) to determine **which bytes on rank `k`** are being addressed.
-2. The compiler **lowers** the extraction to a **sequence of low-level open-share-memory API calls** that, when executed at the issuing rank, **copy data from / to the remote rank `k`'s** (or, when `rank_id` equals the local rank, the rank's own) local share. Read-style ops emit remote-read / pull-style transfers; write-style ops emit remote-write / push-style transfers; in-place views over **the same rank as the issuing one** can avoid copies entirely and use a local pointer.
-3. The compiler **honors the construction-time readiness invariant**: the lowered transfers are emitted **only on program paths where the construction barrier (§6.2) has completed**, so every dereferenced byte is guaranteed to be published in the open-share-memory address space.
-4. The resulting transfers are scheduled / interleaved with the rest of the rank's local computation by the simpler runtime, the same way other GM↔SRAM transfers are scheduled today; the **fact** that the source / destination is a remote rank is, at this layer, just another route in the open-share-memory address space.
+**Remote case (`rank_id != self_rank`).** The pypto compiler **resolves** the op against the `sharded_tensor`'s metadata (`shape`, `tile_shape`, `rank_shape`, partition rule) to determine **which bytes on rank `rank_id`** are being addressed, and **lowers** the extraction to a sequence of low-level **`open_share_memory` API calls**. These come in two flavors:
 
-Operations that do **not** move data — pure metadata reshapes that do not change byte layout, for example — may be lowered to **no transfer at all**, just a metadata update. Whether a given reshape is metadata-only on a `sharded_tensor` follows the same rules as for an ordinary GM tensor (see the warnings in [Tensor `tile_shape`](tensor_layout.md) §4.1 about layout-affecting operations), with the additional constraint that the metadata change is scoped to **rank `rank_id`'s** slice only.
+- **Synchronous** API calls block the issuing rank until the requested bytes are available locally (read) or until the remote write has been observably delivered (write).
+- **Asynchronous** API calls return a handle / event that can be polled or awaited later, allowing the issuing rank to overlap remote transfer with local computation. The simpler runtime is responsible for scheduling and completion-tracking these handles, the same way it does for in-flight DMAs today.
+
+The choice between the synchronous and asynchronous flavor is made by the compiler based on the surrounding schedule (or by the user, if the surface API exposes the choice). Either flavor uses byte addresses derived from `shape`, `tile_shape`, `rank_shape`, and `rank_id`, and either flavor is **legal only on program paths where the construction barrier (§6.2) has completed**, so every dereferenced byte is guaranteed to be published in the open-share-memory address space.
+
+Operations that do **not** move data — pure metadata reshapes that do not change byte layout, for example — may be lowered to **no transfer at all**, just a metadata update on rank `rank_id`'s slice. Whether a given reshape is metadata-only on a `sharded_tensor` follows the same rules as for an ordinary GM tensor (see the warnings in [Tensor `tile_shape`](tensor_layout.md) §4.1 about layout-affecting operations), with the additional constraint that the metadata change is scoped to **rank `rank_id`'s** slice only.
+
+#### 5.3.1 Preferred embodiment: UB `ubmem export` / `ubmem import` of remote shares at setup time
+
+The Unified Bus (UB) supports **remote memory export** and **remote memory import**: a process can **export** a region of its address space, and another process can **import** that exported region into its own address space, getting back a **local virtual base address** that, when accessed, transparently routes the traffic to the exporter's bytes over UB.
+
+In the **preferred embodiment** of `sharded_tensor` on UB-enabled platforms, the simpler runtime exploits this **at setup time** — i.e. as part of the open-share-memory join in §6.2:
+
+1. **Each rank exports its local share** of the `sharded_tensor` to UB (`ubmem export`).
+2. **Each rank imports** every other rank's exported share (`ubmem import`), receiving **one mapped local base address per remote rank**.
+3. After the construction barrier returns, every rank holds a **per-rank local pointer** into every rank's slice: its own share by direct local allocation, every remote share by UB import mapping.
+
+With these mappings in hand, **remote access does not need to go through an explicit `open_share_memory` API call at every site**: it can be performed directly using the **mapped local base address** for the target rank. Concretely:
+
+- **Direct CPU load / store.** A CPU on the issuing rank can dereference the mapped pointer to read or write rank `k`'s share like ordinary local memory; UB transparently carries the traffic.
+- **MTE access (`TLOAD` / `TSTORE`).** The MTE / DMA engine can be programmed with `TLOAD` / `TSTORE` against the **mapped local base address** for rank `k` (plus the offset computed from `shape`, `tile_shape`, `rank_shape`, and the in-slice index) and bulk-transfer remote bytes the same way it bulk-transfers local GM bytes.
+
+The compiler's lowering for the **remote case** therefore **prefers** to emit **direct addressed access** through the imported mapping when the platform offers it, and **falls back** to explicit `open_share_memory` API calls (sync or async, as above) when a UB-style import mapping is not available. The **user-facing semantics** of the extraction op are **identical** in either case; only the generated code differs.
+
+This embodiment is the basis on which §8.1 (simpler runtime over Unified bus) is built; it also gives a uniform low-level model:
+
+| `rank_id` | What the compiler emits |
+|-----------|--------------------------|
+| omitted / `self_rank` | normal tensor codegen against the local allocation |
+| remote rank, UB available | normal load/store or `TLOAD` / `TSTORE` against the **`ubmem import`-mapped** local base address for that rank |
+| remote rank, UB not available | explicit synchronous or asynchronous `open_share_memory` API calls |
 
 ### 5.4 What this implies for the user
 
-- The user **must** supply `rank_id` whenever they extract from a `sharded_tensor`. Forgetting it is a **type / API error**, caught by the compiler.
-- The user can **read or write any rank's slice** (subject to the program's higher-level synchronization and memory-model rules), but **only one rank's slice per call**.
-- The cost of the extraction depends on locality: extraction with `rank_id == self_rank` is local; extraction with `rank_id != self_rank` is a remote transfer over the open-share-memory transport.
+- For **own-share** access, the user **may omit** `rank_id` (or pass `rank_id = self_rank` explicitly); the compiler treats the result as a **normal `tensor`** and emits ordinary local-tensor code (no remote transport, no symmetric-memory machinery).
+- For **remote** access, the user **must** supply `rank_id` of the remote rank. Forgetting `rank_id` while addressing a remote slice is a **type / API error**, caught by the compiler. A single call still operates on **exactly one rank's slice** (§5.2); to fetch from multiple ranks, issue multiple extractions.
+- The user can **read or write any rank's slice** (subject to the program's higher-level synchronization and memory-model rules); the choice between **synchronous** and **asynchronous** lowering for remote access can be left to the compiler / runtime or, where the surface API exposes it, expressed by the user.
+- The **cost** of the extraction depends on locality: own-share is free (local memory); remote is a UB-mediated access (direct load/store or `TLOAD` / `TSTORE` through the `ubmem import` mapping in the preferred embodiment, or an explicit sync/async `open_share_memory` API call when UB import/export is not available).
 
 ## 6. Allocation, scope, and lifecycle (collective semantics)
 
@@ -142,8 +180,8 @@ This means:
 
 After a `sharded_tensor` is **defined** at this rank (its local slice has been carved out of the scope ring buffer and its symmetric-memory metadata has been initialized), it must **invoke the `open_share_memory` API** to **join** all ranks together for this tensor. This step:
 
-1. Registers / publishes the rank's local share of the symmetric region with the open-share-memory layer so that **every other rank** can address it using the symmetric addressing contract.
-2. Performs a **global synchronization** — modeled as an **all-to-all** style barrier across **all `rank_num` ranks** — in which every rank announces "**I have finished setting up my share of this `sharded_tensor`**" and waits until **every** other rank has done the same.
+1. Registers / publishes the rank's local share of the symmetric region with the open-share-memory layer so that **every other rank** can address it using the symmetric addressing contract. **In the preferred UB embodiment (§5.3.1), this step is implemented as a `ubmem export` of the local share and a corresponding `ubmem import` of every other rank's exported share**, so that — once the barrier in step 2 returns — each rank holds a **mapped local base address per remote rank** for direct CPU load/store and MTE `TLOAD` / `TSTORE` access. On platforms without UB import/export, this step degrades to a plain registration with the open-share-memory layer; access is then through explicit sync/async `open_share_memory` API calls.
+2. Performs a **global synchronization** — modeled as an **all-to-all** style barrier across **all `rank_num` ranks** — in which every rank announces "**I have finished setting up (and, where applicable, importing the remote shares of) this `sharded_tensor`**" and waits until **every** other rank has done the same.
 3. Is **blocking**: the constructing program path on each rank does **not** proceed past the construction point until the synchronization is complete. Only after the sync returns does the `sharded_tensor` become **fully ready**: from that moment on, **any rank** is permitted to issue accesses (local or remote-via-symmetric-memory) to **any** part of the tensor under the established addressing contract.
 
 **Why a global, blocking sync is required.** Until every rank has finished its setup, a remote access from rank A into rank B's slice can land on uninitialized / unmapped / not-yet-published memory. A weaker (e.g. pairwise, or non-blocking) synchronization would expose a race window in which the symmetric addressing contract holds at the language level but does not hold at the physical level. The all-to-all barrier closes that window; the **blocking** semantics make the readiness invariant **lexically observable** in the program — once construction returns, the tensor is usable globally, period.
@@ -179,7 +217,7 @@ After a `sharded_tensor` is **defined** at this rank (its local slice has been c
 |------|----------------------------------|------------------------|
 | Allocate | Carve the **1 / rank_num** local share from the scope's ring buffer at the current scope depth `d`; build local metadata (`shape`, `tile_shape`, `rank_shape`, `rank_id`, `rank_num`, open-share-memory handle). | None yet. |
 | Open share memory join | Publish the local share via the `open_share_memory` API. | **All-to-all global barrier**: every rank reports "my share is ready" and waits. **Blocking**; on return, the sharded tensor is **fully ready globally**. |
-| Use | Local and remote accesses are legal under the symmetric addressing contract. | None per access (any cross-rank ordering is a regular memory-model concern, not part of construction). |
+| Use | Own-share access uses **normal tensor codegen** (no `rank_id` needed in the surface API). Remote access (`rank_id != self_rank`) uses, in the **preferred UB embodiment**, **direct load/store or `TLOAD` / `TSTORE` against the `ubmem import`-mapped base address** for that rank; otherwise, **synchronous or asynchronous `open_share_memory` API calls**. | None per access (any cross-rank ordering is a regular memory-model concern, not part of construction). |
 | Retire | Drop scope token / `ref_count` reaches the retirement condition; release the local slot back to the ring. | **Collective barrier (default)**: every rank reaches retirement; after the barrier, the symmetric region's local share is reclaimed on every rank in lockstep. |
 
 ## 7. Coexistence with normal and tile-consecutive tensors (programming paradigm)
@@ -218,8 +256,9 @@ After the design is accepted, the following areas will need coordinated updates 
 The simpler runtime is the natural home for `sharded_tensor`'s underlying mechanics:
 
 - **Storage and addressability.** Implement `sharded_tensor`'s rank-partitioned storage **using the open shared-memory layer over the Unified bus**. Each rank's local share is registered with the open-share-memory layer at construction time; remote ranks address it through the open-share-memory address space.
+- **Preferred UB embodiment: `ubmem` export / import at setup (§5.3.1).** During construction (§6.2), each rank `ubmem export`s its local share and `ubmem import`s every other rank's exported share, ending up with **one mapped local base address per remote rank**. Remote access then uses **direct CPU load/store** or **MTE `TLOAD` / `TSTORE`** against the mapped base — **no per-access `open_share_memory` API call is required**. This embodiment is preferred whenever UB export/import is available; the runtime must publish the per-remote-rank mapped base addresses to the compiler / kernel side so codegen can use them.
 - **Construction and retirement collectives.** Provide the **all-to-all blocking barrier** at construction (§6.2) and the **collective retirement barrier** at the retirement event (§6.3, default), riding the same transport.
-- **Extraction lowering target.** Expose the **low-level open-share-memory API** (point-to-point copy from / to a remote rank's published region, plus local-pointer access when `rank_id == self_rank`) that the pypto compiler targets when it lowers `view` / `reshape` / `slice` / etc. on a `sharded_tensor` (§5.3). Each high-level extraction call becomes one or more such API calls, with byte addresses derived from `shape`, `tile_shape`, `rank_shape`, and `rank_id`.
+- **Extraction lowering target.** Expose the **low-level `open_share_memory` API** in **synchronous and asynchronous** flavors (point-to-point copy from / to a remote rank's published region) for platforms where the UB import-mapping path is not available, plus local-pointer access when `rank_id == self_rank`. The pypto compiler picks between (a) direct load/store or `TLOAD` / `TSTORE` against the imported mapping (preferred embodiment) and (b) explicit `open_share_memory` API calls (fallback) when lowering `view` / `reshape` / `slice` / etc. on a `sharded_tensor` (§5.3). Byte addresses are derived from `shape`, `tile_shape`, `rank_shape`, and `rank_id` regardless of which path is taken.
 - **Tensormap interaction.** Continue to use the **logical** tensor extents (and per-rank slice extents from `rank_shape`) for overlap and dependency reasoning at this rank; the **collective** events (construction / retirement barriers) appear as additional happens-before edges in the schedule but do not change overlap analysis on the local tensor side.
 - **Coexistence with local tensors.** The simpler runtime **must** preserve today's allocation / reclamation paths for normal `tensor`s and tile-consecutive `tensor`s at every hierarchy layer (§7). The shared-memory machinery is invoked **only** for `sharded_tensor` instances.
 
@@ -247,7 +286,7 @@ The simpler runtime is the natural home for `sharded_tensor`'s underlying mechan
 | Allocation | Same as a normal `tensor`: local variable of an orchestrator / incore function; placed in the **scope ring buffer** at the relevant scope depth. |
 | Construction sync | After local setup, invoke `open_share_memory` API; **global all-to-all blocking barrier** across all `rank_num` ranks; tensor becomes **fully ready globally** only after the barrier returns. |
 | Retirement sync | Default: **collective, blocking** global barrier so every rank releases its share at the same logical instant — under explicit review (Section 6.3 / Q5) for cost and error-handling complexity. |
-| Access semantics | All extraction / layout ops (`view`, `reshape`, `slice`, …) take an explicit **`rank_id`** argument and operate on **one rank's slice at a time**. |
-| Lowering | The pypto compiler converts `rank_id`-keyed extraction into **low-level open-share-memory API calls** that copy data to / from the target rank; the simpler runtime implements this via **open shared-memory over the Unified bus**. |
+| Access semantics | Extraction / layout ops (`view`, `reshape`, `slice`, …) take a **`rank_id`** argument and operate on **one rank's slice at a time**. **`rank_id` may be omitted for own-share access** — the local slice is then handled as a **normal `tensor`**. |
+| Lowering | Local case: normal tensor codegen. Remote case: in the **preferred UB embodiment**, direct CPU load/store or MTE `TLOAD` / `TSTORE` against the **`ubmem import`-mapped** local base address of the target rank (set up at construction time); fallback on non-UB platforms is **synchronous or asynchronous `open_share_memory` API calls**. |
 | Coexistence | Normal `tensor`s and **tile-consecutive** `tensor`s remain definable / allocatable at **every** layer of the pypto runtime hierarchy; they are local-only and cannot be shared across nodes. |
 | **Status** | **Experimental** design; **not** a committed product feature until the pypto team approves and implementation planning completes. |
