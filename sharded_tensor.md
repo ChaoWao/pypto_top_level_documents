@@ -21,7 +21,7 @@ Inherits:
 
 `sharded_tensor` plays **two** complementary roles in pypto:
 
-- A **programming paradigm for cross-node data placement** — declaring, in one place, how a logically global tensor is distributed across the participating ranks, with `shape`, `tile_shape`, and `rank_shape` carrying the partitioning through the type system. One declaration replaces the conventional pattern of every rank manually allocating its own slice and hand-agreeing on offsets, strides, and synchronization points.
+- A **programming paradigm for cross-node data placement** — declaring, in one place, how a logically global tensor is distributed across the participating ranks, with `shape`, `tile_shape`, `shard_shape`, and `rank_shape` (the latter two both multi-dimensional) carrying the partitioning through the type system, and a `rank_index` vector keying any per-rank access. One declaration replaces the conventional pattern of every rank manually allocating its own slice and hand-agreeing on offsets, strides, and synchronization points.
 - A **memory management mechanism** — collective allocation in the scope ring buffer (§6.1), an `open_share_memory` join with the all-to-all global barrier at construction (§6.2), lifetime tracking, and (default) collective retirement (§6.3). Bugs of the form *"rank 3 freed early while rank 5 was still reading"* become **type-level** errors rather than runtime races.
 
 Building on these two roles, **the direction this design recommends** is:
@@ -36,7 +36,7 @@ ST.all_reduce(op=pl.ReduceOp.SUM)            # collective expressed against the 
 ST.all_gather(target=YT)                     # YT is itself a sharded_tensor with the gathered partitioning
 ST.reduce_scatter(op=pl.ReduceOp.SUM)
 ST.all_to_all(target=YT)
-ST.send(rank_id=k);  ST.recv(rank_id=k)      # PP-style point-to-point
+ST.send(rank_index=k);  ST.recv(rank_index=k)  # PP-style point-to-point; rank_index is a vector of length len(rank_shape)
 ```
 
 The reader of `ST.all_reduce(op=pl.ReduceOp.SUM)` sees, **from the type alone**, what is being reduced, across whom (the world over which `ST` is sharded), and with what partitioning. Threading per-rank buffers, counts, communicator handles, and streams through every call site is replaced by a **single typed argument**. This materially improves the **clarity of program semantics** at every cross-node call site.
@@ -47,7 +47,7 @@ The recommendation above is about the **shape of the surface API**, not about ho
 
 | Concern | Provided by |
 |---------|-------------|
-| **Definition and data-structure layer** — type, metadata (`shape` / `tile_shape` / `rank_shape`), per-rank allocation, lifetime barriers, addressing model, **typed surface for collectives** | `sharded_tensor` (this document) |
+| **Definition and data-structure layer** — type, metadata (`shape` / `tile_shape` / `shard_shape` / `rank_shape`, with `rank_index` keying per-rank access), per-rank allocation, lifetime barriers, addressing model, **typed surface for collectives** | `sharded_tensor` (this document) |
 | **Implementation layer for cross-rank operations** — collectives, P2P, fused exchange-and-reduce, …; transport, algorithm, scheduling | A collective communication library (or libraries), free to pick **any** transport per operation, including but **not limited to** the direct-access path of §5.3 / §5.3.1 |
 
 ### Positioning relative to existing frameworks
@@ -97,8 +97,17 @@ In an **open share memory** system, every node that takes part in symmetric shar
 
 | Name | Meaning |
 |------|--------|
-| `rank_id` | The identifier of this participating node, in `0 .. rank_num - 1` (exact inclusive range is defined by the open share memory spec; this document assumes zero-based contiguous ranks unless otherwise specified). |
+| `rank_id` | The flat identifier of this participating node, in `0 .. rank_num - 1` (exact inclusive range is defined by the open share memory spec; this document assumes zero-based contiguous ranks unless otherwise specified). |
 | `rank_num` | The **total** number of sharing nodes in the partition. All sharded tensors in a given program region agree on the same `rank_num` (or a compatible subset model if the spec allows subgroups; **subgroups are out of scope** unless the team extends this document). |
+
+`sharded_tensor` adds, **on top of** the flat `rank_id` / `rank_num` pair from open share memory, a **multi-dimensional view** of the rank set:
+
+| Name | Meaning |
+|------|--------|
+| `rank_shape` | The **shape of the rank grid**, a tuple of positive integers. `prod(rank_shape) == rank_num`. The grid arranges the participating ranks into a multi-dimensional lattice whose dimensionality matches the tensor's `shape` (one rank-grid axis per tensor axis; an unsharded tensor axis simply has `rank_shape[i] == 1`). |
+| `rank_index` | A **vector** of length `len(rank_shape)` whose `i`-th component lies in `0 .. rank_shape[i] - 1`. **This is the key the user supplies to identify which rank's share is being accessed.** A deterministic linearization (row-major over `rank_shape` is the design default unless the team picks otherwise) maps `rank_index` to the flat `rank_id` of the open-share-memory layer. |
+
+`rank_id` is the **low-level, open-share-memory-facing** identifier and continues to be used for the symmetric-memory contract (publication, mapping, naming). `rank_index` is the **high-level, sharded-tensor-facing** identifier the user supplies at every extraction or remote-access site (§5).
 
 Symmetric shared memory **coordinates** (allocation, mapping, and visibility) are defined by the open share memory layer. `sharded_tensor` **does not redefine** the low-level mechanics; it **binds** tensor metadata to that layer so the compiler and runtime can reason about **which rank owns which slice** of storage and how the **logical whole tensor** is reassembled for semantics and (where applicable) debugging or verification.
 
@@ -109,47 +118,113 @@ A **host / ordinary `tensor`** (in the single-node or monolithic-storage sense) 
 A **`sharded_tensor`** has the **same logical metadata** as a tensor: `shape`, `dtype`, optional `tile_shape` for GM tile layout where applicable, strides/device placement metadata as defined by the implementation, and so on. The **difference** is **where the bytes live**:
 
 - **Total element count** (and total byte size for a given layout) is still determined by the **global** `shape` and `dtype` (and layout).
-- **Physical storage** is **evenly** distributed: each of the `rank_num` ranks provides storage for **exactly** **1 / rank_num** of the **total** tensor size (in bytes), under the symmetric allocation policy.
+- **Physical storage** is **evenly** distributed: each of the `rank_num` ranks (where `rank_num == prod(rank_shape)`) provides storage for **exactly** **1 / rank_num** of the **total** tensor size (in bytes), under the symmetric allocation policy. The shape of each rank's local piece is given by `shard_shape` (§3).
 
-**Uniform split assumption (design default).** The intended default is an **even byte-wise** partition. If a future need arises for **non-uniform** rank slices, that would be a separate design (not implied by this version of `sharded_tensor`).
+**Uniform split assumption (design default).** The intended default is an **even byte-wise** partition: every rank holds a slab of identical `shard_shape`. If a future need arises for **non-uniform** rank slices, that would be a separate design (not implied by this version of `sharded_tensor`).
 
-**Relationship between global shape and per-rank footprint.** For a global shape `S = (s0, s1, ..., s_{d-1})` and element size `E`, the total size is `prod(S) * E` bytes. Each rank holds `prod(S) * E / rank_num` bytes. The **concrete mapping** from global indices to `(rank_id, local offset)` is a **separate, rank-ordering policy** (e.g. linear partition along the last dimension, block-cyclic, etc.); this document only **requires** that the partition be **symmetric in responsibility** (each rank **1 / rank_num**) and **documented** in a follow-on section once the team picks a default algorithm.
+**Relationship between global shape, shard shape, and rank grid.** A `sharded_tensor` is **defined** by two multi-dimensional shape attributes that together fix the global tensor and the partition: the **per-rank** `shard_shape` and the **rank-grid** `rank_shape`. Under the default uniform partition,
+`shape[i] == shard_shape[i] * rank_shape[i]` for every dimension `i`, and
+`rank_num == prod(rank_shape)`.
+The rank holding the slab whose origin is at the multi-dimensional offset `(i0 * shard_shape[0], i1 * shard_shape[1], ..., i_{D-1} * shard_shape[D-1])` is identified by the vector `rank_index = (i0, i1, ..., i_{D-1})`. The mapping from `rank_index` to the flat open-share-memory `rank_id` is a deterministic linearization of `rank_shape` (row-major default; see §3 and §1). This document **requires** that the partition be **symmetric in responsibility** (each rank **1 / rank_num**) and **documented** in a follow-on section once the team picks a default linearization.
 
-## 3. The `rank_shape` attribute
+## 3. The `shard_shape` and `rank_shape` attributes
 
-In addition to the standard tensor fields **`shape`** and optional **`tile_shape`**, a `sharded_tensor` carries **`rank_shape`**.
+In addition to the standard tensor fields **`shape`** and optional **`tile_shape`**, a `sharded_tensor` carries **two new multi-dimensional shape attributes** — `shard_shape` and `rank_shape` — that **together define** how the global tensor is partitioned across the participating ranks. The user-facing key into the rank grid is the vector **`rank_index`** (§1, §5).
 
 | Field | Role |
 |-------|------|
-| `shape` | The **global** logical shape of the entire sharded tensor. The union of all ranks' contributions **logically** covers this shape. |
+| `shape` | The **global** logical shape of the entire sharded tensor. The union of all ranks' contributions covers this shape exactly, with no overlap. |
 | `tile_shape` | Optional, same meaning as for GM tensors: physical tile shape for tile-contiguous layout, when the backend uses it. See [Tensor `tile_shape`](tensor_layout.md). |
-| `rank_shape` | The **per-rank logical shape** (or shape **fraction**) whose **product** × `sizeof(dtype)` × layout overhead matches the **1 / rank_num** storage fraction on that rank, **consistent** across ranks up to a **reordering of dimensions** that the spec may allow. In the simplest case, `rank_shape` is literally `shape` with one or more dimensions divided by `rank_num` (or a factor that yields an integer), so that `prod(rank_shape) * rank_num == prod(shape)` when a simple replication-free partition along one axis is used. |
+| `shard_shape` | The **per-rank logical shape** — a tuple of positive integers giving the shape of **one rank's local slab**, in the same dimension order as `shape`. Every rank holds an identically-shaped slab (default uniform partition). The total number of elements per rank is `prod(shard_shape)`, and the total local byte size is `prod(shard_shape) * sizeof(dtype)` (modulo any layout overhead). |
+| `rank_shape` | The **shape of the rank grid** — a tuple of positive integers, one per tensor dimension, telling **how many ranks** participate along each tensor axis. `prod(rank_shape) == rank_num`. A value `rank_shape[i] == 1` means that axis is not sharded (no split along dim `i`). |
+| `rank_index` (per-access argument, not stored on the tensor) | A **vector** of length `len(rank_shape)`, with `0 <= rank_index[i] < rank_shape[i]`, identifying **one** rank in the grid. Supplied by the user at every extraction / remote-access site (§5) to say "I want this rank's slab." |
 
-**Intended meaning.** `rank_shape` answers: *"What is the **tensor-shaped footprint** of **my** piece on this `rank_id` in the same dimension order as `shape`?"* It is **not** a second global shape; it is a **per-rank slice description** in **shape** form, such that the **combination** of all ranks' stored pieces (under the chosen partition rule) **covers** the full `shape` without overlap.
+### 3.1 The two-shape definition: `shard_shape × rank_shape == shape`
 
-**Example (illustrative, not normative for index mapping).** Global `shape = (1024, 1024)` and `rank_num = 4` might use `rank_shape = (256, 1024)` if the partition is along the first dimension, so that each rank stores a contiguous 256×1024 slab. Another policy might use `rank_shape = (1024, 256)` for a partition along the second dimension. The team must **fix one default** in the full specification to avoid silent divergence between compiler and runtime.
+The defining identity of a `sharded_tensor` under the default uniform partition is, **dimension-wise**:
 
-**Consistency rules (draft for review).**
+```
+shape[i] == shard_shape[i] * rank_shape[i]    for every i in 0 .. D-1
+```
 
-1. `len(rank_shape) == len(shape)`.
-2. For every dimension `i`, `shape[i] % rank_shape[i] == 0` **in the default uniform partition** (or the spec states how remainder ranks are handled if `shape` is not divisible; **remainder policy is open** until the team decides).
-3. The **sum over ranks of the per-rank element count** must equal the **global** element count `prod(shape)`.
+Equivalently: each tensor axis `i` is split into `rank_shape[i]` equal pieces, each of length `shard_shape[i]`. Tensor axes with `rank_shape[i] == 1` are **not** split (one rank covers the whole axis); tensor axes with `rank_shape[i] > 1` are sharded across that many ranks.
+
+The rank identified by `rank_index = (i0, i1, ..., i_{D-1})` holds the contiguous global slab
+
+```
+[ i0 * shard_shape[0], (i0+1) * shard_shape[0] ) ×
+[ i1 * shard_shape[1], (i1+1) * shard_shape[1] ) ×
+... ×
+[ i_{D-1} * shard_shape[D-1], (i_{D-1}+1) * shard_shape[D-1] )
+```
+
+so `shard_shape` and `rank_shape` together encode **both** the per-rank footprint **and** the global-to-local index mapping, **without** the user having to specify a separate "partition rule".
+
+### 3.2 Examples
+
+**Example A — 1-D split along the rows.** Global `shape = (1024, 1024)` with 4 ranks, splitting only the row dimension:
+
+```
+shard_shape = (256, 1024)
+rank_shape  = (4,   1)
+rank_num    = 4
+```
+
+Rank `rank_index = (2, 0)` holds the slab `[512, 768) × [0, 1024)`.
+
+**Example B — 1-D split along the columns.** Same global shape, 4 ranks, columns split:
+
+```
+shard_shape = (1024, 256)
+rank_shape  = (1,    4)
+```
+
+Rank `rank_index = (0, 3)` holds the slab `[0, 1024) × [768, 1024)`.
+
+**Example C — 2-D rank grid.** Same global shape, 8 ranks, 2-D split (`2 × 4` rank grid):
+
+```
+shard_shape = (512, 256)
+rank_shape  = (2,   4)
+rank_num    = 8
+```
+
+Rank `rank_index = (1, 2)` holds the slab `[512, 1024) × [512, 768)`.
+
+The 2-D case is the **multi-dimensional generalization** of "split along one axis" and is a first-class case of the design — neither awkward nor a special policy.
+
+### 3.3 Consistency rules (draft for review)
+
+1. `len(shape) == len(shard_shape) == len(rank_shape) == D` (one entry per tensor dimension).
+2. For every dimension `i`, `shape[i] == shard_shape[i] * rank_shape[i]` (default uniform partition; the **remainder policy** when global `shape[i]` is not divisible by the chosen `rank_shape[i]` is **open** until the team decides — see Section 9).
+3. `prod(rank_shape) == rank_num`, where `rank_num` is the open-share-memory rank count for this `sharded_tensor`.
+4. `rank_index` arguments to access sites (§5) must satisfy `0 <= rank_index[i] < rank_shape[i]` for every `i`; values out of range are a **type / API error**.
+
+### 3.4 Mapping `rank_index` to open-share-memory `rank_id`
+
+The flat `rank_id` used by the open-share-memory layer is obtained from `rank_index` by a deterministic linearization of `rank_shape`. The design **default** is **row-major** (last axis fastest):
+
+```
+rank_id = ((i0 * rank_shape[1] + i1) * rank_shape[2] + i2) * ... + i_{D-1}
+```
+
+Any other linearization (column-major, or a chosen permutation of axes) is admissible **as long as it is fixed and documented**, because compiler, runtime, and any debugging / verification tooling all need to agree on the same mapping. The choice is local to this design and does not change `sharded_tensor`'s user-facing API: users always supply `rank_index`; the linearization is internal.
 
 ## 4. Inheritance and API surface (design sketch)
 
-- **Type relationship:** `sharded_tensor` is a **subtype** (derivative class) of `tensor` in the type system, with **additional** constraints and **additional** metadata (`rank_id` context, `rank_num`, `rank_shape`, and a reference to symmetric shared-memory handle as required by `open_share_memory`).
+- **Type relationship:** `sharded_tensor` is a **subtype** (derivative class) of `tensor` in the type system, with **additional** constraints and **additional** metadata: the **per-rank** `shard_shape`, the **rank-grid** `rank_shape` (multi-dimensional), the local rank's own `rank_index` (a vector identifying this process within the grid), the derived `rank_num == prod(rank_shape)` and `rank_id` (flat id from `rank_index`), and a reference to the symmetric shared-memory handle as required by `open_share_memory`.
 
 - **Behavior:** Operations that only need **local** data (the rank's slice) can be defined naturally. Operations that need a **global** view may require **collective** or **runtime-assisted** materialization, or are **rejected** at compile time. The **exact** split of allowed ops is for the pypto design review to decide.
 
 - **Interoperability with `tensor`:** Converting `tensor` ↔ `sharded_tensor` may require **copy** or **collective** placement; a **view** of one rank’s slice as a local `tensor` is a common pattern if the open share memory model exposes a local base pointer and length for each rank.
 
-## 5. Access semantics: subtensor extraction is keyed by `rank_id`
+## 5. Access semantics: subtensor extraction is keyed by `rank_index`
 
-A `sharded_tensor` is **always accessed with respect to a specific `rank_id`**. The global tensor is logically one object, but its **bytes are partitioned across ranks**, and any operation that **selects, reshapes, or otherwise extracts a sub-region** must say **whose share** it is talking about — with one shorthand: when a rank accesses **its own share**, `rank_id` may be omitted (it defaults to `self_rank`), in which case the slice is treated as a **normal `tensor`** (see §5.1).
+A `sharded_tensor` is **always accessed with respect to a specific `rank_index`** — the multi-dimensional vector that picks out one cell of the rank grid (§1, §3). The global tensor is logically one object, but its **bytes are partitioned across ranks**, and any operation that **selects, reshapes, or otherwise extracts a sub-region** must say **whose share** it is talking about — with one shorthand: when a rank accesses **its own share**, `rank_index` may be omitted (it defaults to `self_rank_index`), in which case the slice is treated as a **normal `tensor`** (see §5.1).
 
-### 5.1 Subtensor extraction takes an explicit `rank_id` argument
+### 5.1 Subtensor extraction takes an explicit `rank_index` argument
 
-Every layout / extraction op on a `sharded_tensor` carries an **additional `rank_id`** argument that is **not** present on the corresponding op for an ordinary `tensor`. This applies to (at minimum):
+Every layout / extraction op on a `sharded_tensor` carries an **additional `rank_index`** argument (a vector of length `len(rank_shape)`) that is **not** present on the corresponding op for an ordinary `tensor`. This applies to (at minimum):
 
 - `view`
 - `reshape` (both shallow and deep variants — see [Tensor `tile_shape`](tensor_layout.md))
@@ -157,53 +232,59 @@ Every layout / extraction op on a `sharded_tensor` carries an **additional `rank
 - `transpose`, `permute`, `expand`, and other layout/view operations the surface API exposes
 - conversion to a local `tensor` view of the slice
 
-The `rank_id` argument **selects which rank's 1 / rank_num share is being operated on**. The op produces a result whose semantics are defined **only with respect to that rank's slice**; the operation does **not** implicitly fan out across all ranks.
+The `rank_index` argument **selects which rank's 1 / rank_num share is being operated on**. The op produces a result whose semantics are defined **only with respect to that rank's slice** (whose footprint is exactly `shard_shape`); the operation does **not** implicitly fan out across all ranks.
 
 ```python
 # Sketch (illustrative; final API names are TBD)
-ST = pl.sharded_tensor(shape=(M, N), dtype=pl.fp16, rank_shape=(M / rank_num, N))
+# Global (M, N), 2-D rank grid (R0, R1), per-rank slab (M/R0, N/R1).
+ST = pl.sharded_tensor(
+    shape=(M, N),
+    dtype=pl.fp16,
+    shard_shape=(M // R0, N // R1),
+    rank_shape=(R0, R1),
+)
 
-# Extract a (16, 16) tile from rank 3's slice — explicit rank_id is required.
-local_tile = ST.view(rank_id=3, region=((r0, r0+16), (c0, c0+16)))
+# Extract a (16, 16) tile from the rank at grid position (1, 2) — explicit rank_index is required.
+local_tile = ST.view(rank_index=(1, 2), region=((r0, r0+16), (c0, c0+16)))
 
-# Reshape rank 0's slice — again, rank_id is part of the call.
-local_view = ST.reshape(rank_id=0, new_shape=(...))
+# Reshape the rank-(0, 0) slice — again, rank_index is part of the call.
+local_view = ST.reshape(rank_index=(0, 0), new_shape=(...))
 ```
 
-**Local-share shorthand: `rank_id` may be omitted when a rank accesses its own share.** When a rank accesses **its own slice** of the `sharded_tensor` (i.e. `rank_id == self_rank`), the `rank_id` argument **may be omitted**; equivalently, when omitted, `rank_id` is **defaulted to `self_rank`**. Under this shorthand, the result is, from the compiler's and the kernel's perspective, **just a normal `tensor`** view of the local share: the standard tensor APIs (`view`, `reshape`, `slice`, `TLOAD` / `TSTORE`, ...) apply with their **ordinary** signatures, the same layout / `tile_shape` rules apply, and **no remote transport or symmetric-memory machinery is involved**. This is what makes consuming one's own share cheap inside an InCore kernel: the compiler treats the local slice indistinguishably from a normal local tensor allocated at this rank.
+**Local-share shorthand: `rank_index` may be omitted when a rank accesses its own share.** When a rank accesses **its own slice** of the `sharded_tensor` (i.e. `rank_index == self_rank_index`), the `rank_index` argument **may be omitted**; equivalently, when omitted, `rank_index` is **defaulted to `self_rank_index`** (the local rank's own grid coordinates). Under this shorthand, the result is, from the compiler's and the kernel's perspective, **just a normal `tensor`** view of the local share — a tensor of shape `shard_shape`: the standard tensor APIs (`view`, `reshape`, `slice`, `TLOAD` / `TSTORE`, ...) apply with their **ordinary** signatures, the same layout / `tile_shape` rules apply, and **no remote transport or symmetric-memory machinery is involved**. This is what makes consuming one's own share cheap inside an InCore kernel: the compiler treats the local slice indistinguishably from a normal local tensor of shape `shard_shape` allocated at this rank.
 
 ```python
-# Local-share shorthand — rank_id omitted; result is a normal tensor view.
-local = ST.view(region=((r0, r0+16), (c0, c0+16)))           # implicitly rank_id=self_rank
+# Local-share shorthand — rank_index omitted; result is a normal tensor view.
+local = ST.view(region=((r0, r0+16), (c0, c0+16)))                  # implicitly rank_index=self_rank_index
 
 # Equivalent explicit form.
-local = ST.view(rank_id=self_rank, region=((r0, r0+16), (c0, c0+16)))
+local = ST.view(rank_index=self_rank_index, region=((r0, r0+16), (c0, c0+16)))
 ```
 
 ### 5.2 One rank at a time
 
-The `rank_id`-keyed model (with the own-share shorthand of §5.1) is the **access discipline** of `sharded_tensor`: a single call site **operates on exactly one rank's slice** — either the local rank (when `rank_id` is omitted or equals `self_rank`) or one specific remote rank. There is **no fused multi-rank extraction primitive** in this design; if a kernel needs data from several ranks, it issues several extractions, **each** with its own `rank_id` (or each implicitly local).
+The `rank_index`-keyed model (with the own-share shorthand of §5.1) is the **access discipline** of `sharded_tensor`: a single call site **operates on exactly one rank's slice** — either the local rank (when `rank_index` is omitted or equals `self_rank_index`) or one specific remote rank, identified by its grid coordinates. There is **no fused multi-rank extraction primitive** in this design; if a kernel needs data from several ranks, it issues several extractions, **each** with its own `rank_index` (or each implicitly local).
 
 This restriction is deliberate:
 
-- It keeps the **addressing model explicit**: the programmer (and the compiler) always know **which** physical bytes are being read or written.
+- It keeps the **addressing model explicit**: the programmer (and the compiler) always know **which** physical bytes are being read or written, and at **which** grid coordinates.
 - It avoids implicit collective traffic: a one-line `view` cannot accidentally generate an all-ranks broadcast or gather.
-- It maps **one-to-one** onto the underlying open-share-memory access primitives (described next), which are themselves **point-to-point** between the issuing rank and one remote rank.
+- It maps **one-to-one** onto the underlying open-share-memory access primitives (described next), which are themselves **point-to-point** between the issuing rank and one remote rank (after `rank_index` is linearized to the open-share-memory `rank_id` per §3.4).
 
 ### 5.3 Lowering: local stays as a normal tensor, remote goes through `open_share_memory` APIs
 
-The lowering of an extraction op depends on whether `rank_id` resolves to the **local** rank or to a **remote** rank.
+The lowering of an extraction op depends on whether `rank_index` resolves to the **local** rank or to a **remote** rank.
 
-**Local case (`rank_id == self_rank`, including the omitted-`rank_id` shorthand).** No transport is involved. The compiler treats the result as a **normal `tensor`** view of the local share, lowers it via the **standard** tensor codegen path (load/store, `TLOAD` / `TSTORE`, and any tile-shape-driven addressing per [Tensor `tile_shape`](tensor_layout.md)), and applies the same layout / aliasing rules as for any other local tensor. There is **no `open_share_memory` call** in the emitted code for this path.
+**Local case (`rank_index == self_rank_index`, including the omitted-`rank_index` shorthand).** No transport is involved. The compiler treats the result as a **normal `tensor`** view of the local share (a tensor of shape `shard_shape`), lowers it via the **standard** tensor codegen path (load/store, `TLOAD` / `TSTORE`, and any tile-shape-driven addressing per [Tensor `tile_shape`](tensor_layout.md)), and applies the same layout / aliasing rules as for any other local tensor. There is **no `open_share_memory` call** in the emitted code for this path.
 
-**Remote case (`rank_id != self_rank`).** The pypto compiler **resolves** the op against the `sharded_tensor`'s metadata (`shape`, `tile_shape`, `rank_shape`, partition rule) to determine **which bytes on rank `rank_id`** are being addressed, and **lowers** the extraction to a sequence of low-level **`open_share_memory` API calls**. These come in two flavors:
+**Remote case (`rank_index != self_rank_index`).** The pypto compiler **resolves** the op against the `sharded_tensor`'s metadata (`shape`, `tile_shape`, `shard_shape`, `rank_shape`, and the `rank_index` → `rank_id` linearization of §3.4) to determine **which bytes on the rank at grid position `rank_index`** are being addressed, and **lowers** the extraction to a sequence of low-level **`open_share_memory` API calls**. These come in two flavors:
 
 - **Synchronous** API calls block the issuing rank until the requested bytes are available locally (read) or until the remote write has been observably delivered (write).
 - **Asynchronous** API calls return a handle / event that can be polled or awaited later, allowing the issuing rank to overlap remote transfer with local computation. The simpler runtime is responsible for scheduling and completion-tracking these handles, the same way it does for in-flight DMAs today.
 
-The choice between the synchronous and asynchronous flavor is made by the compiler based on the surrounding schedule (or by the user, if the surface API exposes the choice). Either flavor uses byte addresses derived from `shape`, `tile_shape`, `rank_shape`, and `rank_id`, and either flavor is **legal only on program paths where the construction barrier (§6.2) has completed**, so every dereferenced byte is guaranteed to be published in the open-share-memory address space.
+The choice between the synchronous and asynchronous flavor is made by the compiler based on the surrounding schedule (or by the user, if the surface API exposes the choice). Either flavor uses byte addresses derived from `shape`, `tile_shape`, `shard_shape`, `rank_shape`, and `rank_index`, and either flavor is **legal only on program paths where the construction barrier (§6.2) has completed**, so every dereferenced byte is guaranteed to be published in the open-share-memory address space.
 
-Operations that do **not** move data — pure metadata reshapes that do not change byte layout, for example — may be lowered to **no transfer at all**, just a metadata update on rank `rank_id`'s slice. Whether a given reshape is metadata-only on a `sharded_tensor` follows the same rules as for an ordinary GM tensor (see the warnings in [Tensor `tile_shape`](tensor_layout.md) §4.1 about layout-affecting operations), with the additional constraint that the metadata change is scoped to **rank `rank_id`'s** slice only.
+Operations that do **not** move data — pure metadata reshapes that do not change byte layout, for example — may be lowered to **no transfer at all**, just a metadata update on the slice owned by the rank at `rank_index`. Whether a given reshape is metadata-only on a `sharded_tensor` follows the same rules as for an ordinary GM tensor (see the warnings in [Tensor `tile_shape`](tensor_layout.md) §4.1 about layout-affecting operations), with the additional constraint that the metadata change is scoped to **the slice at `rank_index`** only.
 
 #### 5.3.1 Preferred embodiment: UB `ubmem export` / `ubmem import` of remote shares at setup time
 
@@ -217,23 +298,23 @@ In the **preferred embodiment** of `sharded_tensor` on UB-enabled platforms, the
 
 With these mappings in hand, **remote access does not need to go through an explicit `open_share_memory` API call at every site**: it can be performed directly using the **mapped local base address** for the target rank. Concretely:
 
-- **Direct CPU load / store.** A CPU on the issuing rank can dereference the mapped pointer to read or write rank `k`'s share like ordinary local memory; UB transparently carries the traffic.
-- **MTE access (`TLOAD` / `TSTORE`).** The MTE / DMA engine can be programmed with `TLOAD` / `TSTORE` against the **mapped local base address** for rank `k` (plus the offset computed from `shape`, `tile_shape`, `rank_shape`, and the in-slice index) and bulk-transfer remote bytes the same way it bulk-transfers local GM bytes.
+- **Direct CPU load / store.** A CPU on the issuing rank can dereference the mapped pointer to read or write the share at grid position `rank_index` like ordinary local memory; UB transparently carries the traffic.
+- **MTE access (`TLOAD` / `TSTORE`).** The MTE / DMA engine can be programmed with `TLOAD` / `TSTORE` against the **mapped local base address** for the rank at `rank_index` (plus the offset computed from `shape`, `tile_shape`, `shard_shape`, `rank_shape`, and the in-slice index) and bulk-transfer remote bytes the same way it bulk-transfers local GM bytes.
 
 The compiler's lowering for the **remote case** therefore **prefers** to emit **direct addressed access** through the imported mapping when the platform offers it, and **falls back** to explicit `open_share_memory` API calls (sync or async, as above) when a UB-style import mapping is not available. The **user-facing semantics** of the extraction op are **identical** in either case; only the generated code differs.
 
 This embodiment is the basis on which §8.1 (simpler runtime over Unified bus) is built; it also gives a uniform low-level model:
 
-| `rank_id` | What the compiler emits |
-|-----------|--------------------------|
-| omitted / `self_rank` | normal tensor codegen against the local allocation |
-| remote rank, UB available | normal load/store or `TLOAD` / `TSTORE` against the **`ubmem import`-mapped** local base address for that rank |
+| `rank_index` resolution | What the compiler emits |
+|-------------------------|--------------------------|
+| omitted / equals `self_rank_index` | normal tensor codegen against the local allocation (a tensor of shape `shard_shape`) |
+| remote rank (any `rank_index != self_rank_index`), UB available | normal load/store or `TLOAD` / `TSTORE` against the **`ubmem import`-mapped** local base address for that rank's share |
 | remote rank, UB not available | explicit synchronous or asynchronous `open_share_memory` API calls |
 
 ### 5.4 What this implies for the user
 
-- For **own-share** access, the user **may omit** `rank_id` (or pass `rank_id = self_rank` explicitly); the compiler treats the result as a **normal `tensor`** and emits ordinary local-tensor code (no remote transport, no symmetric-memory machinery).
-- For **remote** access, the user **must** supply `rank_id` of the remote rank. Forgetting `rank_id` while addressing a remote slice is a **type / API error**, caught by the compiler. A single call still operates on **exactly one rank's slice** (§5.2); to fetch from multiple ranks, issue multiple extractions.
+- For **own-share** access, the user **may omit** `rank_index` (or pass `rank_index = self_rank_index` explicitly); the compiler treats the result as a **normal `tensor`** of shape `shard_shape` and emits ordinary local-tensor code (no remote transport, no symmetric-memory machinery).
+- For **remote** access, the user **must** supply the `rank_index` vector of the remote rank in the rank grid. Forgetting `rank_index` while addressing a remote slice — or passing one with the wrong arity (length not equal to `len(rank_shape)`) or out-of-range components — is a **type / API error**, caught by the compiler. A single call still operates on **exactly one rank's slice** (§5.2); to fetch from multiple ranks, issue multiple extractions.
 - The user can **read or write any rank's slice** (subject to the program's higher-level synchronization and memory-model rules); the choice between **synchronous** and **asynchronous** lowering for remote access can be left to the compiler / runtime or, where the surface API exposes it, expressed by the user.
 - The **cost** of the extraction depends on locality: own-share is free (local memory); remote is a UB-mediated access (direct load/store or `TLOAD` / `TSTORE` through the `ubmem import` mapping in the preferred embodiment, or an explicit sync/async `open_share_memory` API call when UB import/export is not available).
 
@@ -243,7 +324,7 @@ This embodiment is the basis on which §8.1 (simpler runtime over Unified bus) i
 
 A normal `tensor` (other than externally-referenced tensor memory, which is brought in by reference and **not** allocated by pypto) is **defined and allocated as a local variable** of an **orchestrator** function or an **incore** function. These tensors are placed in the **ring hierarchy** according to the **grammatical scope** at which they are introduced — see [`machine_hierarchy_and_function_hierarchy.md`](machine_hierarchy_and_function_hierarchy.md) (scope depth `d`, `task_ring[d]` / `buffer_ring[d]`, scope-token reclamation), and the runtime details in the runtime design documents in this directory.
 
-`sharded_tensor` is allocated and defined in the **same fashion**: it is introduced as a local variable inside the relevant orchestrator / incore scope, and its **storage slot** is taken from the **scope's ring buffer** at that scope depth, just like a normal `tensor`. The **only** difference at allocation time is **what** the slot holds: the sharded tensor's storage is the rank's **1 / rank_num** local share, and the metadata also carries the `open_share_memory` symmetric-region handle, `rank_id`, `rank_num`, and `rank_shape`.
+`sharded_tensor` is allocated and defined in the **same fashion**: it is introduced as a local variable inside the relevant orchestrator / incore scope, and its **storage slot** is taken from the **scope's ring buffer** at that scope depth, just like a normal `tensor`. The **only** difference at allocation time is **what** the slot holds: the sharded tensor's storage is the rank's local slab of shape `shard_shape` (which is **1 / rank_num** of the global byte size, where `rank_num == prod(rank_shape)`), and the metadata also carries the `open_share_memory` symmetric-region handle, the local `rank_index` (this rank's grid coordinates), the rank-grid `rank_shape`, the per-rank `shard_shape`, and the derived `rank_id` / `rank_num`.
 
 This means:
 
@@ -289,10 +370,10 @@ After a `sharded_tensor` is **defined** at this rank (its local slice has been c
 
 | Step | What happens locally (per rank) | Global synchronization |
 |------|----------------------------------|------------------------|
-| Allocate | Carve the **1 / rank_num** local share from the scope's ring buffer at the current scope depth `d`; build local metadata (`shape`, `tile_shape`, `rank_shape`, `rank_id`, `rank_num`, open-share-memory handle). | None yet. |
-| Open share memory join | Publish the local share via the `open_share_memory` API. | **All-to-all global barrier**: every rank reports "my share is ready" and waits. **Blocking**; on return, the sharded tensor is **fully ready globally**. |
-| Use | Own-share access uses **normal tensor codegen** (no `rank_id` needed in the surface API). Remote access (`rank_id != self_rank`) uses, in the **preferred UB embodiment**, **direct load/store or `TLOAD` / `TSTORE` against the `ubmem import`-mapped base address** for that rank; otherwise, **synchronous or asynchronous `open_share_memory` API calls**. | None per access (any cross-rank ordering is a regular memory-model concern, not part of construction). |
-| Retire | Drop scope token / `ref_count` reaches the retirement condition; release the local slot back to the ring. | **Collective barrier (default)**: every rank reaches retirement; after the barrier, the symmetric region's local share is reclaimed on every rank in lockstep. |
+| Allocate | Carve the local slab of shape `shard_shape` (= **1 / rank_num** of global bytes) from the scope's ring buffer at the current scope depth `d`; build local metadata (`shape`, `tile_shape`, `shard_shape`, `rank_shape`, `self_rank_index`, `rank_id`, `rank_num`, open-share-memory handle). | None yet. |
+| Open share memory join | Publish the local share via the `open_share_memory` API. | **All-to-all global barrier** across all `prod(rank_shape) == rank_num` ranks: every rank reports "my share is ready" and waits. **Blocking**; on return, the sharded tensor is **fully ready globally**. |
+| Use | Own-share access uses **normal tensor codegen** on a tensor of shape `shard_shape` (no `rank_index` needed in the surface API). Remote access (`rank_index != self_rank_index`) uses, in the **preferred UB embodiment**, **direct load/store or `TLOAD` / `TSTORE` against the `ubmem import`-mapped base address** for the rank at that grid position; otherwise, **synchronous or asynchronous `open_share_memory` API calls**. | None per access (any cross-rank ordering is a regular memory-model concern, not part of construction). |
+| Retire | Drop scope token / `ref_count` reaches the retirement condition; release the local slot back to the ring. | **Collective barrier (default)**: every rank in the grid reaches retirement; after the barrier, the symmetric region's local share is reclaimed on every rank in lockstep. |
 
 ## 7. Coexistence with normal and tile-consecutive tensors (programming paradigm)
 
@@ -320,8 +401,8 @@ This separation keeps the local tensor pipeline (allocation, reclamation via the
 
 After the design is accepted, the following areas will need coordinated updates (mirroring the structure in [Tensor `tile_shape`](tensor_layout.md)):
 
-- **Type system and IR** — new tensor variant with `rank_shape` and symmetric-memory linkage; `rank_id` argument added to extraction / layout ops on `sharded_tensor` (§5).
-- **Compiler** — legality of ops on `sharded_tensor`, propagation of `rank_shape` and global `shape`, codegen for addressing within the local slice, and **lowering of `rank_id`-keyed extraction ops to open-share-memory API calls** (see below).
+- **Type system and IR** — new tensor variant with `shard_shape`, `rank_shape`, and symmetric-memory linkage; `rank_index` (vector) argument added to extraction / layout ops on `sharded_tensor` (§5).
+- **Compiler** — legality of ops on `sharded_tensor`, propagation of `shard_shape`, `rank_shape`, and global `shape` (with the identity `shape[i] == shard_shape[i] * rank_shape[i]`), codegen for addressing within the local slab, and **lowering of `rank_index`-keyed extraction ops to open-share-memory API calls or `ubmem`-mapped direct access** (see below).
 - **Runtime (simpler runtime)** — see dedicated subsection below.
 - **PTOAS / device code** — as needed, if `sharded_tensor` is visible in kernel arguments or lowered device buffers.
 
@@ -332,31 +413,32 @@ The simpler runtime is the natural home for `sharded_tensor`'s underlying mechan
 - **Storage and addressability.** Implement `sharded_tensor`'s rank-partitioned storage **using the open shared-memory layer over the Unified bus**. Each rank's local share is registered with the open-share-memory layer at construction time; remote ranks address it through the open-share-memory address space.
 - **Preferred UB embodiment: `ubmem` export / import at setup (§5.3.1).** During construction (§6.2), each rank `ubmem export`s its local share and `ubmem import`s every other rank's exported share, ending up with **one mapped local base address per remote rank**. Remote access then uses **direct CPU load/store** or **MTE `TLOAD` / `TSTORE`** against the mapped base — **no per-access `open_share_memory` API call is required**. This embodiment is preferred whenever UB export/import is available; the runtime must publish the per-remote-rank mapped base addresses to the compiler / kernel side so codegen can use them.
 - **Construction and retirement collectives.** Provide the **all-to-all blocking barrier** at construction (§6.2) and the **collective retirement barrier** at the retirement event (§6.3, default), riding the same transport.
-- **Extraction lowering target.** Expose the **low-level `open_share_memory` API** in **synchronous and asynchronous** flavors (point-to-point copy from / to a remote rank's published region) for platforms where the UB import-mapping path is not available, plus local-pointer access when `rank_id == self_rank`. The pypto compiler picks between (a) direct load/store or `TLOAD` / `TSTORE` against the imported mapping (preferred embodiment) and (b) explicit `open_share_memory` API calls (fallback) when lowering `view` / `reshape` / `slice` / etc. on a `sharded_tensor` (§5.3). Byte addresses are derived from `shape`, `tile_shape`, `rank_shape`, and `rank_id` regardless of which path is taken.
-- **Tensormap interaction.** Continue to use the **logical** tensor extents (and per-rank slice extents from `rank_shape`) for overlap and dependency reasoning at this rank; the **collective** events (construction / retirement barriers) appear as additional happens-before edges in the schedule but do not change overlap analysis on the local tensor side.
+- **Extraction lowering target.** Expose the **low-level `open_share_memory` API** in **synchronous and asynchronous** flavors (point-to-point copy from / to a remote rank's published region) for platforms where the UB import-mapping path is not available, plus local-pointer access when `rank_index == self_rank_index`. The pypto compiler picks between (a) direct load/store or `TLOAD` / `TSTORE` against the imported mapping (preferred embodiment) and (b) explicit `open_share_memory` API calls (fallback) when lowering `view` / `reshape` / `slice` / etc. on a `sharded_tensor` (§5.3). Byte addresses are derived from `shape`, `tile_shape`, `shard_shape`, `rank_shape`, and `rank_index` regardless of which path is taken; `rank_index` is linearized to the open-share-memory `rank_id` per §3.4.
+- **Tensormap interaction.** Continue to use the **logical** tensor extents (and per-rank slab extents from `shard_shape`) for overlap and dependency reasoning at this rank; the **collective** events (construction / retirement barriers) appear as additional happens-before edges in the schedule but do not change overlap analysis on the local tensor side.
 - **Coexistence with local tensors.** The simpler runtime **must** preserve today's allocation / reclamation paths for normal `tensor`s and tile-consecutive `tensor`s at every hierarchy layer (§7). The shared-memory machinery is invoked **only** for `sharded_tensor` instances.
 
 ## 9. Open questions (for design review)
 
-1. **Default partition** — one-dimensional split vs multi-dimensional, and divisibility when `prod(shape) % rank_num != 0`.
-2. **`tile_shape` interaction** — can `rank_shape` and `tile_shape` be specified together with a **single** clear layout, or do we require `rank_shape` to be tile-aligned in all dimensions when `tile_shape` is set?
-3. **Subgroup / partial participation** — whether `sharded_tensor` is allowed only in **world**-wide `rank_num` or in MPI-style subgroups.
-4. **Naming** — current proposal is `sharded_tensor`; alternatives previously considered include `symmetric_tensor`, `shared_tensor`, and `distributed_tensor`. Final naming should align with the **open share memory** document’s terminology.
-5. **Is a global sync at retirement truly necessary?** See Section 6.3. The default proposal is **yes** (symmetry with construction, no cross-rank use-after-free), but the cost on the critical path and the **distributed error-handling** implications (what happens to a collective retirement barrier when one rank has already failed?) are non-trivial. Possible alternatives the team should rule on:
+1. **Default partition and remainder policy** — under the `shape[i] == shard_shape[i] * rank_shape[i]` model (§3), what is the policy when a tensor dimension is **not** evenly divisible by the chosen `rank_shape[i]`? Options include (a) reject at compile time, (b) pad the global tensor up to the next multiple, (c) allow the last rank along that axis to hold a smaller slab (breaks the uniform-`shard_shape` invariant). And what is the **default** rank-grid shape when the user supplies only `rank_num` (e.g., always 1-D split along dim 0, vs. some heuristic factorization)?
+2. **`tile_shape` interaction** — can `shard_shape`, `rank_shape`, and `tile_shape` be specified together with a **single** clear layout, or do we require `shard_shape` to be tile-aligned in all dimensions when `tile_shape` is set?
+3. **`rank_index` linearization** — fix the canonical linearization from `rank_index` to the open-share-memory `rank_id` (row-major default in §3.4, vs. column-major, vs. an explicitly user-specified permutation). Compiler, runtime, and any debugging / verification tooling must agree on the same mapping.
+4. **Subgroup / partial participation** — whether `sharded_tensor` is allowed only in **world**-wide `rank_num` or in MPI-style subgroups (and, if subgroups are allowed, whether `rank_shape` is interpreted relative to the subgroup or to the world).
+5. **Naming** — current proposal is `sharded_tensor`; alternatives previously considered include `symmetric_tensor`, `shared_tensor`, and `distributed_tensor`. Final naming should align with the **open share memory** document’s terminology.
+6. **Is a global sync at retirement truly necessary?** See Section 6.3. The default proposal is **yes** (symmetry with construction, no cross-rank use-after-free), but the cost on the critical path and the **distributed error-handling** implications (what happens to a collective retirement barrier when one rank has already failed?) are non-trivial. Possible alternatives the team should rule on:
    - **(A)** Collective, blocking retirement (default proposal).
    - **(B)** Collective retirement, but with a defined timeout / fault model (requires specifying a fault-tolerant barrier and a failure policy for the symmetric region).
    - **(C)** Local retirement permitted only for tensors statically proven to have **no remote access** after the retirement point; collective retirement otherwise.
-6. **Failure semantics** — independently of (5), what happens if any rank fails **between** construction sync and retirement? Options span "abort the whole job", "tear down the symmetric region globally", or "fence the failed rank and continue at remaining ranks (advanced; almost certainly out of scope for the experimental version)".
-7. **Sync primitive** — whether to mandate an actual **all-to-all** at construction or accept any **all-ranks barrier with publication** that the open-share-memory layer offers, as long as it provides the same readiness guarantee. The user-visible contract is the same; the implementation cost is not.
-8. **Concrete target workload (the experimental gate).** See **"Why this is still experimental"** near the top of this document. Before promoting `sharded_tensor` past the experimental stage, the team should identify **at least one concrete pypto workload** for which a typed, lifetime-managed `sharded_tensor` abstraction yields a measurable improvement — either:
+7. **Failure semantics** — independently of (6), what happens if any rank fails **between** construction sync and retirement? Options span "abort the whole job", "tear down the symmetric region globally", or "fence the failed rank and continue at remaining ranks (advanced; almost certainly out of scope for the experimental version)".
+8. **Sync primitive** — whether to mandate an actual **all-to-all** at construction or accept any **all-ranks barrier with publication** that the open-share-memory layer offers, as long as it provides the same readiness guarantee. The user-visible contract is the same; the implementation cost is not.
+9. **Concrete target workload (the experimental gate).** See **"Why this is still experimental"** near the top of this document. Before promoting `sharded_tensor` past the experimental stage, the team should identify **at least one concrete pypto workload** for which a typed, lifetime-managed `sharded_tensor` abstraction yields a measurable improvement — either:
    - **(narrow case)** a workload that benefits from the **direct cross-rank access** path of §5.3 / §5.3.1, where expressing the access as a collective is awkward or insufficient; **or**
    - **(broad case)** a workload that benefits from the **typed definitional / lifetime-management** layer of `sharded_tensor` (per the *Design philosophy* section), even when its collectives are still implemented by a hand-tuned library that does **not** use direct remote load / store or `TLOAD` / `TSTORE`.
 
    Without such a workload, the recommendation is to **keep this feature experimental** (or defer it).
-9. **Exact surface API for collectives on `sharded_tensor`.** The *Design philosophy* section settles the **direction** — collectives are exposed as typed methods or functions taking `sharded_tensor` arguments. What remains for the design review:
+10. **Exact surface API for collectives on `sharded_tensor`.** The *Design philosophy* section settles the **direction** — collectives are exposed as typed methods or functions taking `sharded_tensor` arguments. What remains for the design review:
    - **The v1 collective set.** Which of `all_reduce`, `all_gather`, `reduce_scatter`, `all_to_all`, `broadcast`, `scatter`, `gather`, P2P `send` / `recv`, and any pypto-specific composites (e.g., fused exchange-and-reduce) ship in v1?
    - **Method names and signatures.** `ST.all_reduce(op=...)` style methods on `sharded_tensor`, free functions taking `sharded_tensor` arguments, or both? Naming should be consistent with the rest of pypto's typed-API surface.
-   - **Typing of partitioning transformations.** When a collective changes the partitioning (e.g., `all_gather` produces a fully replicated or differently sharded result; `reduce_scatter` from a replicated input produces a sharded result), what is the **return type**? Should the result be another `sharded_tensor` with a different `rank_shape`, a normal `tensor` (when fully replicated and locally addressable), or both depending on call form?
+   - **Typing of partitioning transformations.** When a collective changes the partitioning (e.g., `all_gather` produces a fully replicated or differently sharded result; `reduce_scatter` from a replicated input produces a sharded result), what is the **return type**? Should the result be another `sharded_tensor` with a different `(shard_shape, rank_shape)` pair, a normal `tensor` (when fully replicated and locally addressable), or both depending on call form?
    - **Interaction with the construction / retirement barriers of §6.** Whether each collective is itself a synchronization point, and whether multiple collectives over the same `sharded_tensor` need any extra fencing beyond what the construction barrier already provides.
    - **Implementation backing.** Whether v1 implements collectives over the §5.3 / §5.3.1 direct-access path, over a conventional collective library, or both with a runtime-selectable backend.
 
@@ -364,15 +446,16 @@ The simpler runtime is the natural home for `sharded_tensor`'s underlying mechan
 
 | Concept | Description |
 |--------|-------------|
-| `sharded_tensor` | Derived from `tensor`, with symmetric open-share-memory **partitioned** backing storage. |
-| `rank_id` / `rank_num` | Open share memory: which node, how many nodes. |
-| Storage per rank | **1 / rank_num** of total tensor bytes (even split by default). |
-| `shape` / `tile_shape` / `rank_shape` | Global logical shape, optional physical tile shape, and **per-rank** shape of this rank’s stored fraction (together covering the full tensor). |
+| `sharded_tensor` | Derived from `tensor`, with symmetric open-share-memory **partitioned** backing storage. **Defined by two multi-dimensional shapes:** `shard_shape` (per-rank slab) and `rank_shape` (rank grid), with `shape[i] == shard_shape[i] * rank_shape[i]` for every dim `i`. |
+| `rank_id` / `rank_num` | Open share memory: flat node id, total number of nodes. `rank_num == prod(rank_shape)`. |
+| `rank_shape` / `rank_index` | `rank_shape` is the **multi-dimensional shape of the rank grid**; `rank_index` is the **vector** (length `len(rank_shape)`) that **keys which rank we are accessing**. The deterministic linearization of `rank_index` to `rank_id` is the row-major default of §3.4. |
+| Storage per rank | A slab of shape `shard_shape`, occupying **1 / rank_num** of the total tensor bytes (even split by default). |
+| `shape` / `tile_shape` / `shard_shape` / `rank_shape` | Global logical shape, optional physical tile shape, **per-rank** slab shape, and **rank-grid** shape (together: `shape == shard_shape ⊙ rank_shape`, element-wise product). |
 | Allocation | Same as a normal `tensor`: local variable of an orchestrator / incore function; placed in the **scope ring buffer** at the relevant scope depth. |
-| Construction sync | After local setup, invoke `open_share_memory` API; **global all-to-all blocking barrier** across all `rank_num` ranks; tensor becomes **fully ready globally** only after the barrier returns. |
-| Retirement sync | Default: **collective, blocking** global barrier so every rank releases its share at the same logical instant — under explicit review (Section 6.3 / Q5) for cost and error-handling complexity. |
-| Access semantics | Extraction / layout ops (`view`, `reshape`, `slice`, …) take a **`rank_id`** argument and operate on **one rank's slice at a time**. **`rank_id` may be omitted for own-share access** — the local slice is then handled as a **normal `tensor`**. |
+| Construction sync | After local setup, invoke `open_share_memory` API; **global all-to-all blocking barrier** across all `prod(rank_shape) == rank_num` ranks; tensor becomes **fully ready globally** only after the barrier returns. |
+| Retirement sync | Default: **collective, blocking** global barrier so every rank releases its share at the same logical instant — under explicit review (Section 6.3 / Q6) for cost and error-handling complexity. |
+| Access semantics | Extraction / layout ops (`view`, `reshape`, `slice`, …) take a **`rank_index`** **vector** argument and operate on **one rank's slice at a time**. **`rank_index` may be omitted for own-share access** (defaults to `self_rank_index`) — the local slice is then handled as a **normal `tensor`** of shape `shard_shape`. |
 | Lowering | Local case: normal tensor codegen. Remote case: in the **preferred UB embodiment**, direct CPU load/store or MTE `TLOAD` / `TSTORE` against the **`ubmem import`-mapped** local base address of the target rank (set up at construction time); fallback on non-UB platforms is **synchronous or asynchronous `open_share_memory` API calls**. |
 | Coexistence | Normal `tensor`s and **tile-consecutive** `tensor`s remain definable / allocatable at **every** layer of the pypto runtime hierarchy; they are local-only and cannot be shared across nodes. |
-| Applicability | **Direction set; implementation experimental.** `sharded_tensor` is positioned as pypto's **cross-node programming paradigm** at the hierarchical-runtime layer: a typed declaration of cross-node placement plus collective memory management, *and* the **typed surface for cross-node collective communication** (e.g., `ST.all_reduce(op=...)`). pypto deliberately does **not** mirror the buffer-and-collective-call API of vLLM / SGLang / Megatron-LM / DeepSpeed; the implementation underneath, however, is free to use any transport (collective library, hardware engine, RDMA, or the direct-access path of §5.3 / §5.3.1). Promotion past experimental requires settling the v1 collective surface (Q9) and a concrete target workload — narrow case (direct cross-rank access) or broad case (typed-abstraction ergonomics). See **Design philosophy**, **Why this is still experimental**, and Open questions Q8 / Q9. |
+| Applicability | **Direction set; implementation experimental.** `sharded_tensor` is positioned as pypto's **cross-node programming paradigm** at the hierarchical-runtime layer: a typed declaration of cross-node placement plus collective memory management, *and* the **typed surface for cross-node collective communication** (e.g., `ST.all_reduce(op=...)`). pypto deliberately does **not** mirror the buffer-and-collective-call API of vLLM / SGLang / Megatron-LM / DeepSpeed; the implementation underneath, however, is free to use any transport (collective library, hardware engine, RDMA, or the direct-access path of §5.3 / §5.3.1). Promotion past experimental requires settling the v1 collective surface (Q10) and a concrete target workload — narrow case (direct cross-rank access) or broad case (typed-abstraction ergonomics). See **Design philosophy**, **Why this is still experimental**, and Open questions Q9 / Q10. |
 | **Status** | **Experimental** design; **not** a committed product feature until the pypto team approves, a concrete target workload is identified, and implementation planning completes. |
